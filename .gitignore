@@ -1,0 +1,49 @@
+# ==========================================
+# Ambientes Virtuais e Dependências Python
+# ==========================================
+venv/
+.venv/
+env/
+ENV/
+.env
+__pycache__/
+*.py[cod]
+*$py.class
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ==========================================
+# Credenciais e Tokens (MUITO IMPORTANTE)
+# ==========================================
+# Evita o vazamento das chaves do Google Cloud (Gmail API) e Gemini
+credentials.json
+token.json
+client_secret.json
+client_secret_*.json
+*.pem
+*.key
+
+# ==========================================
+# Arquivos Temporários e Logs da Automação
+# ==========================================
+/temp/
+/downloads/
+/attachments/
+*.log
+*.sqlite3
+/logs/
+
+# ==========================================
+# Configurações de IDEs e Editores
+# ==========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ==========================================
+# Arquivos do Sistema Operacional
+# ==========================================
+.DS_Store
+Thumbs.db
+ehthumbs.db
