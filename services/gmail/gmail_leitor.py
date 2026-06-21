@@ -3,6 +3,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from services.gmail.gmail_leitor import obter_gama_emails, autenticar_gmail
 
 # O escopo 'readonly' garante que o script apenas leia os e-mails, sem risco de apagar nada.
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
