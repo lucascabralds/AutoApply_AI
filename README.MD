@@ -49,3 +49,9 @@ Crie um ambiente virtual e instale as dependências listadas:
 python -m venv venv
 source venv/bin/activate  # No Windows: venv\Scripts\activate
 pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib google-generativeai python-dotenv requests
+### 2. Variáveis de Ambiente (`.env`)
+O projeto utiliza um arquivo `.env` para proteger credenciais e configurar diretórios locais. 
+
+1. Na raiz do projeto, faça uma cópia do arquivo de modelo:
+   ```bash
+   cp .env.example .env
