@@ -1,9 +1,9 @@
 # AutoApply AI 🚀
 
 ## 🎯 Intenção do Projeto
-Este projeto é um pipeline inteligente de automação de e-mails desenvolvido para otimizar a gestão da caixa de entrada e acelerar o processo de candidaturas a vagas de emprego. Construído em **Python**, o sistema integra a **Gmail API**, **Google Drive API** e a inteligência artificial do **Google Gemini** para atuar como um assistente de carreira em segundo plano. 
+Este projeto é um pipeline inteligente de automação de e-mails desenvolvido para otimizar a gestão da caixa de entrada e acelerar o processo de candidaturas a vagas de emprego. Construído em **Python**, o sistema integra a **Gmail API**, **Google Drive API** e a inteligência artificial do **Google Gemini** para atuar como um assistente de carreira e segurança em segundo plano. 
 
-O sistema não apenas resume comunicações diárias, mas realiza uma triagem ativa de oportunidades profissionais, decodifica links complexos de certificados, valida requisitos e prepara o terreno para o envio automatizado de currículos focados em posições de tecnologia.
+O sistema não apenas resume comunicações diárias, mas realiza uma triagem ativa de oportunidades profissionais, decodifica links complexos de certificados, extrai códigos de segurança (OTP) de forma inteligente, valida requisitos e prepara o terreno para o envio automatizado de currículos focados em posições de tecnologia.
 
 ## 📥 O que o sistema captura?
 O algoritmo monitora ativamente a conta do Gmail e realiza a extração e o processamento das seguintes informações:
@@ -19,6 +19,9 @@ O algoritmo monitora ativamente a conta do Gmail e realiza a extração e o proc
 * **Gestão de Certificados e Capacitação:**
   * Identificação de e-mails contendo certificados de plataformas educacionais (Udemy, DIO, etc.).
   * Decodificação de **Links de Rastreamento (AWS SES/SendGrid)** para extração da URL real do certificado.
+* **Monitoramento de Acessos e Segurança:**
+  * Extração em tempo real de **códigos numéricos (OTP)**, links de login temporários e links de recuperação de senha (ex: Spotify, Cinemark, Ticket360).
+  * Identificação de contexto via IA para descartar falsos positivos (como e-mails promocionais com "códigos de desconto").
 
 ## 🛠️ Stack e Integrações
 * **Linguagem Principal:** Python 3.x
@@ -32,6 +35,7 @@ O algoritmo monitora ativamente a conta do Gmail e realiza a extração e o proc
 
 * **`extrator_vagas_v2.py`**: Motor de extração focado em varrer a caixa de entrada, identificar plataformas de emprego e estruturar JSONs com múltiplas ofertas contidas no mesmo e-mail.
 * **`gmail_extrator_certificados.py`**: Script dedicado a buscar aprovações em cursos, baixar PDFs anexos ou extrair links de plataformas, salvando-os em um diretório local.
+* **`alerta_acessos.py`**: Assistente de segurança digital que monitora a entrada de OTPs, PINs e links de login temporários, validando a intenção do e-mail através do Gemini e imprimindo a credencial diretamente no terminal.
 * **`ai_engine.py`**: Módulo de integração com o Gemini para forçar saídas em JSON estrito e realizar a validação de *match* de perfil.
 * **`classifier.py`**: Filtro heurístico rápido para poupar tokens de IA, descartando falsos positivos (ex: e-mails de condomínio) antes de chamar o Gemini.
 
