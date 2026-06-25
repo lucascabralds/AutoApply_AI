@@ -49,9 +49,43 @@ Crie um ambiente virtual e instale as dependências listadas:
 python -m venv venv
 source venv/bin/activate  # No Windows: venv\Scripts\activate
 pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib google-generativeai python-dotenv requests
+```
+
 ### 2. Variáveis de Ambiente (`.env`)
 O projeto utiliza um arquivo `.env` para proteger credenciais e configurar diretórios locais. 
 
 1. Na raiz do projeto, faça uma cópia do arquivo de modelo:
-   ```bash
-   cp .env.example .env
+```bash
+cp .env.example .env
+```
+2. Abra o arquivo `.env` recém-criado e preencha com as suas informações reais (API Key do Gemini e o caminho da sua pasta local).
+
+---
+
+## 🏷️ Sistema de Marcadores (Labels) no Gmail
+Para evitar processamento duplicado, o sistema interage diretamente com as *labels* do usuário, criando e atribuindo categorias automaticamente:
+
+* 🔴 **`Certificado_Extraido`**: Aplicado quando o script consegue baixar o anexo (PDF/IMG) ou extrai e salva com sucesso a URL limpa de um certificado.
+* 🟢 **`Certificados_Pendentes`**: Aplicado quando um e-mail de certificado é detectado, mas exige intervenção humana (ex: falha no download, link quebrado ou necessidade de login complexo).
+* *O script ignora automaticamente qualquer e-mail que já possua uma dessas duas etiquetas.*
+
+---
+
+## 🚀 Sugestões de Melhorias Futuras (Roadmap)
+
+Para as próximas fases de evolução arquitetural, considera-se a implementação de:
+
+1. **Automação de Finanças e Despesas Domésticas:** Integrar um filtro no Gmail para identificar notas fiscais, faturas e comprovantes de contas de consumo (luz, internet). O Gemini irá extrair os dados e inseri-los automaticamente em uma tabela dedicada no banco de dados (Supabase), permitindo o cruzamento com planilhas financeiras preexistentes.
+2. **Monitoramento Automotivo e Burocrático:** Implementar um módulo para varrer notificações de órgãos de trânsito (ex: Detran), referentes a CNH, IPVA, licenciamento e seguros. O assistente irá extrair datas de vencimento e valores, injetando alertas automaticamente no Google Calendar e salvando os documentos no Google Drive.
+3. **Notificações Push (Webhooks):** Integrar o `alerta_acessos.py` com a API do Telegram ou Discord. Assim, ao invés de exibir os códigos OTP apenas no terminal, o sistema enviaria o PIN diretamente para o smartphone, acelerando o fluxo de login em serviços de terceiros.
+4. **Containerização (Docker):** Criar um `Dockerfile` e um `docker-compose.yml` para isolar a aplicação, facilitando o deploy e a configuração de *cron jobs* para rodar a automação periodicamente em servidores ou instâncias de nuvem.
+5. **Persistência em Banco de Dados:** Substituir a exportação de arquivos TXT e agrupamentos em memória por um banco de dados relacional (como PostgreSQL ou SQLite via Supabase) para criar um histórico robusto das empresas que mais enviaram vagas e mapear tendências de tecnologias solicitadas.
+6. **Disparo Automatizado (`messages.send`):** Finalizar a **Fase 3** do projeto construindo a funcionalidade que anexa o currículo estruturado e realiza a candidatura ativa utilizando o protocolo MIME da Gmail API.
+
+---
+
+## ⚠️ Notas Técnicas Importantes
+
+1. **Links de Rastreamento (Tracking Links):** Plataformas como a DIO (Digital Innovation One) utilizam a AWS SES (`awstrack.me`) para mascarar as URLs. O módulo de certificados utiliza `urllib.parse` para contornar esse redirecionamento e extrair o endereço limpo.
+2. **Plataformas Fechadas (Udemy, LinkedIn Learning):** E-mails contendo links "Visualizar Certificado" que exigem autenticação na plataforma não baixarão o PDF via script (para evitar bloqueios por tentativas sem sessão). O sistema salva inteligentemente um arquivo `.txt` no diretório de destino apontando a URL exata para extração manual.
+3. **Limpeza de Payload:** A extração da API do Gmail implementa `_limpar_html()` para contornar sujeiras comuns no formato `text/plain`, como injeções de blocos CSS inline ocultos que quebram o parser.
