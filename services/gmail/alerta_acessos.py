@@ -1,4 +1,5 @@
 import os
+import sys
 import base64
 import json
 from dotenv import load_dotenv
@@ -7,7 +8,11 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-import google.generativeai as genai
+
+# Permite importar rota_ia_client.py (na raiz do projeto) a partir deste
+# módulo, que vive em services/gmail/.
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
+from rota_ia_client import chamar_ia as _chamar_rota_ia
 
 # ===========================================================================
 # Configurações Iniciais
@@ -15,12 +20,6 @@ import google.generativeai as genai
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 
 load_dotenv()
-
-# Configuração do Gemini
-API_KEY = os.getenv("GEMINI_API_KEY")
-if not API_KEY:
-    raise ValueError("[ERRO] Chave GEMINI_API_KEY não encontrada no arquivo .env")
-genai.configure(api_key=API_KEY)
 
 # ===========================================================================
 # 1) Autenticação no Gmail
@@ -67,11 +66,10 @@ def extrair_texto_email(payload):
 # ===========================================================================
 def analisar_acesso_com_ia(remetente, assunto, corpo_email):
     """
-    Utiliza o Gemini para ler o e-mail e determinar com precisão se é uma
-    tentativa de login, enviando o código extraído em formato JSON.
+    Utiliza o gateway Rota.IA (http://localhost:8787/v1/chat/completions) para
+    ler o e-mail e determinar com precisão se é uma tentativa de login,
+    enviando o código extraído em formato JSON.
     """
-    model = genai.GenerativeModel('gemini-2.5-flash')
-    
     prompt = f"""
     Você é um assistente de segurança digital focado em extrair códigos de autenticação.
     Eu vou te passar os dados de um e-mail. Sua tarefa é analisar o contexto e me dizer
@@ -94,16 +92,11 @@ def analisar_acesso_com_ia(remetente, assunto, corpo_email):
     """
 
     try:
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-                temperature=0.1 # Temperatura baixíssima pois queremos precisão cirúrgica, não criatividade
-            )
-        )
-        return json.loads(response.text)
+        # Temperatura baixíssima pois queremos precisão cirúrgica, não criatividade
+        resposta = _chamar_rota_ia(prompt, temperature=0.1)
+        return json.loads(resposta)
     except Exception as e:
-        print(f"[ERRO IA] Falha ao processar com Gemini: {e}")
+        print(f"[ERRO IA] Falha ao processar via Rota.IA: {e}")
         return None
 
 # ===========================================================================
