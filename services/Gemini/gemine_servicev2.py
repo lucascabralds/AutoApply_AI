@@ -30,115 +30,34 @@ Todas as funções:
 import os
 import re
 import json
-import time
 import logging
+import sys
 
 from dotenv import load_dotenv
+
+# Permite importar rota_ia_client.py (na raiz do projeto) a partir deste
+# módulo, que vive em services/Gemini/.
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
+from rota_ia_client import chamar_ia as _chamar_rota_ia
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Inicialização do cliente (suporta os dois SDKs)
+# Todas as chamadas de IA passam pelo gateway local Rota.IA
+# (http://localhost:8787/v1/chat/completions), que decide por trás qual
+# provedor cadastrado (Gemini, OpenAI, Claude, Groq, DeepSeek, etc.) atende
+# e troca sozinho de provedor se algum falhar. Ver rota_ia_client.py.
 # ---------------------------------------------------------------------------
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MODELO         = "gemini-2.5-flash"
-
-_client     = None
-_GENAI_NEW  = False
-
-try:
-    from google import genai as _google_genai
-    from google.genai import types as _genai_types
-    _GENAI_NEW = True
-except ImportError:
-    try:
-        import google.generativeai as _genai_legacy
-    except ImportError:
-        pass
-
-
-def _get_client():
-    global _client
-    if _client is not None:
-        return _client
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY não encontrada no .env")
-    if _GENAI_NEW:
-        _client = _google_genai.Client(api_key=GEMINI_API_KEY)
-    else:
-        _genai_legacy.configure(api_key=GEMINI_API_KEY)
-        _client = _genai_legacy.GenerativeModel(MODELO)
-    return _client
-
-
-# ---------------------------------------------------------------------------
-# Núcleo: chamada com retry automático
-# ---------------------------------------------------------------------------
-
-def _extrair_retry_delay(exc: Exception) -> float:
-    """Lê o retryDelay do corpo do erro 429/503 da API."""
-    txt = str(exc)
-    m = re.search(r"'retryDelay':\s*'([0-9.]+)(ms|s)'", txt)
-    if m:
-        v, u = float(m.group(1)), m.group(2)
-        return (v / 1000.0) if u == "ms" else v
-    m2 = re.search(r"retry in ([0-9.]+)s", txt)
-    if m2:
-        return float(m2.group(1))
-    return 60.0
-
 
 def _chamar_gemini(prompt: str, max_tentativas: int = 3) -> str:
     """
-    Chama o Gemini com retry automático em 429/503.
-    Sempre pede resposta em JSON (application/json).
+    Envia o prompt para o gateway Rota.IA com retry automático em 429/503.
+    Mantém o nome original da função por compatibilidade com o resto do módulo.
     Raises a última exceção se todas as tentativas falharem.
     """
-    client = _get_client()
-    ultima_exc = None
-
-    for tentativa in range(1, max_tentativas + 1):
-        try:
-            if _GENAI_NEW:
-                resp = client.models.generate_content(
-                    model=MODELO,
-                    contents=prompt,
-                    config=_genai_types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        temperature=0.1,
-                    ),
-                )
-            else:
-                resp = client.generate_content(
-                    prompt,
-                    generation_config=_genai_legacy.GenerationConfig(
-                        response_mime_type="application/json",
-                        temperature=0.1,
-                    ),
-                )
-            return resp.text
-
-        except Exception as exc:
-            ultima_exc = exc
-            codigo = str(exc)
-
-            # Só faz retry em rate-limit e sobrecarga temporária
-            if "429" not in codigo and "503" not in codigo:
-                raise
-
-            if tentativa == max_tentativas:
-                break
-
-            espera = _extrair_retry_delay(exc)
-            logger.warning(
-                f"Gemini {'429' if '429' in codigo else '503'} — "
-                f"aguardando {espera:.1f}s antes da tentativa {tentativa+1}/{max_tentativas}..."
-            )
-            time.sleep(espera + 1)
-
-    raise ultima_exc
+    return _chamar_rota_ia(prompt, max_tentativas=max_tentativas)
 
 
 def _parse_json(raw: str) -> dict | list:
