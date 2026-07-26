@@ -1,26 +1,23 @@
 import os
+import sys
 import json
-import google.generativeai as genai
 from dotenv import load_dotenv
+
+# Permite importar rota_ia_client.py (na raiz do projeto) a partir deste
+# módulo, que vive em services/Gemini/.
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
+from rota_ia_client import chamar_ia as _chamar_rota_ia
 
 # 1. Carrega as variáveis de ambiente do arquivo .env
 load_dotenv()
 
-# 2. Configura a chave da API
-API_KEY = os.getenv("GEMINI_API_KEY")
-if not API_KEY:
-    raise ValueError("Chave da API do Gemini não encontrada. Verifique seu arquivo .env")
-
-genai.configure(api_key=API_KEY)
 
 def analisar_vaga_com_gemini(texto_da_vaga: str) -> dict:
     """
-    Envia o texto da vaga para o Gemini e retorna um dicionário (JSON) 
+    Envia o texto da vaga para o gateway Rota.IA
+    (http://localhost:8787/v1/chat/completions) e retorna um dicionário (JSON)
     com as informações estruturadas.
     """
-    # Usando o modelo flash, que é o mais rápido e barato para processamento de texto
-    model = genai.GenerativeModel('gemini-2.5-flash')
-    
     # Engenharia de Prompt focada no seu caso de uso
     prompt = f"""
     Você é um assistente de RH especializado em tecnologia.
@@ -31,26 +28,22 @@ def analisar_vaga_com_gemini(texto_da_vaga: str) -> dict:
     - "modelo_de_trabalho": (string: Remoto, Híbrido, Presencial ou Não informado)
     - "vaga_para_python_ou_dados": (booleano: true se tiver relação com Python, Dados ou Automação)
 
+    Responda APENAS com o JSON (sem crases, sem texto fora do JSON).
+
     Texto da vaga:
     {texto_da_vaga}
     """
 
     try:
-        # Faz a requisição para a API solicitando que o retorno seja obrigatoriamente um JSON
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-                temperature=0.2 # Temperatura baixa para respostas mais precisas e menos criativas
-            )
-        )
-        
+        # Faz a requisição para o gateway Rota.IA solicitando que o retorno seja JSON
+        resposta = _chamar_rota_ia(prompt, temperature=0.2)
+
         # Converte a string JSON de resposta para um dicionário Python
-        dados_vaga = json.loads(response.text)
+        dados_vaga = json.loads(resposta)
         return dados_vaga
 
     except Exception as e:
-        print(f"[ERRO] Falha ao processar com o Gemini: {e}")
+        print(f"[ERRO] Falha ao processar via Rota.IA: {e}")
         return {}
 
 # ==========================================
@@ -64,9 +57,9 @@ if __name__ == "__main__":
     Benefícios: Vale alimentação e plano de saúde.
     Modelo: 100% Home Office.
     """
-    
-    print("Enviando solicitação para o Gemini...\n")
+
+    print("Enviando solicitação para o gateway Rota.IA...\n")
     resultado = analisar_vaga_com_gemini(vaga_exemplo)
-    
+
     print("=== Resultado Estruturado ===")
     print(json.dumps(resultado, indent=4, ensure_ascii=False))
