@@ -62,16 +62,10 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload
 
 # ---------------------------------------------------------------------------
-# [FIX-1] Gemini — migrado para google.genai (não-deprecated)
+# [FIX-1] Gemini — chamadas migradas para o gateway local Rota.IA
+# (http://localhost:8787/v1/chat/completions). Ver rota_ia_client.py.
 # ---------------------------------------------------------------------------
-try:
-    from google import genai as google_genai
-    from google.genai import types as genai_types
-    GENAI_NEW = True
-except ImportError:
-    # fallback para quem ainda não atualizou o package
-    import google.generativeai as genai_legacy
-    GENAI_NEW = False
+from rota_ia_client import chamar_ia as _rota_ia_chamar_ia
 
 # ---------------------------------------------------------------------------
 # Supabase
@@ -895,70 +889,12 @@ except ImportError as _e:
     _GEMINI_SERVICE_OK = False
 
 
-# ── Fallback: mantém client interno se gemini_service não estiver disponível ──
-
-_gemini_client = None
-
-def _get_gemini():
-    global _gemini_client
-    if _gemini_client is not None:
-        return _gemini_client
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY não encontrada no .env")
-    if GENAI_NEW:
-        _gemini_client = google_genai.Client(api_key=GEMINI_API_KEY)
-    else:
-        genai_legacy.configure(api_key=GEMINI_API_KEY)
-        _gemini_client = genai_legacy.GenerativeModel("gemini-2.5-flash")
-    return _gemini_client
-
-
-def _extrair_retry_delay(exc: Exception) -> float:
-    txt = str(exc)
-    m = re.search(r"'retryDelay':\s*'([0-9.]+)(ms|s)'", txt)
-    if m:
-        v, u = float(m.group(1)), m.group(2)
-        return (v / 1000.0) if u == "ms" else v
-    m2 = re.search(r"retry in ([0-9.]+)s", txt)
-    if m2:
-        return float(m2.group(1))
-    return 60.0
-
+# ── Fallback: usado apenas se gemini_service.py não estiver disponível ──
+# Todas as requisições passam pelo gateway local Rota.IA (rota_ia_client.py),
+# que fala o formato OpenAI-compatible em http://localhost:8787/v1/chat/completions.
 
 def _gerar_gemini(prompt: str, max_tentativas: int = 3) -> str:
-    client = _get_gemini()
-    ultima_exc = None
-    for tentativa in range(1, max_tentativas + 1):
-        try:
-            if GENAI_NEW:
-                resp = client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=prompt,
-                    config=genai_types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        temperature=0.1,
-                    ),
-                )
-            else:
-                resp = client.generate_content(
-                    prompt,
-                    generation_config=genai_legacy.GenerationConfig(
-                        response_mime_type="application/json",
-                        temperature=0.1,
-                    ),
-                )
-            return resp.text
-        except Exception as exc:
-            ultima_exc = exc
-            codigo = str(exc)
-            if "429" not in codigo and "503" not in codigo:
-                raise
-            if tentativa == max_tentativas:
-                break
-            espera = _extrair_retry_delay(exc)
-            Log.warn(f"  Gemini {429 if '429' in codigo else 503} — aguardando {espera:.1f}s...")
-            time.sleep(espera + 1)
-    raise ultima_exc
+    return _rota_ia_chamar_ia(prompt, max_tentativas=max_tentativas)
 
 
 def _parse_gemini_json(raw: str, esperado_dict: bool = True) -> dict:
