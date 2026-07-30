@@ -39,6 +39,7 @@ Correções aplicadas (v2):
 import os
 import re
 import sys
+import unicodedata
 import json
 import time
 import base64
@@ -50,6 +51,7 @@ import io
 from html import unescape
 
 from dotenv import load_dotenv
+from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
 # Google / Gmail / Drive
@@ -268,6 +270,26 @@ _PALETA_GMAIL = {
 }
 
 # ---------------------------------------------------------------------------
+# [FIX] Regra de exclusão — e-mails gerados pelo PRÓPRIO AutoApply AI
+# (ex.: o briefing diário que o robô manda para a própria caixa de entrada,
+# assunto "[AutoApply AI] Briefing Matinal — dd/mm/aaaa"). Como os módulos
+# de vagas/gerais varrem TODA a caixa de entrada recente ("newer_than:Xd"),
+# esse e-mail entrava no pipeline e era classificado por IA como qualquer
+# outro — poluindo o relatório e gastando budget à toa. Esta checagem roda
+# antes de qualquer heurística/IA e é 100% grátis.
+# ---------------------------------------------------------------------------
+PREFIXOS_EMAIL_PROPRIO = [
+    "[autoapply ai]",
+]
+
+
+def _eh_email_proprio(assunto: str, remetente: str = "") -> bool:
+    """True se o e-mail foi gerado pelo próprio pipeline AutoApply AI."""
+    ass = (assunto or "").strip().lower()
+    return any(ass.startswith(p) for p in PREFIXOS_EMAIL_PROPRIO)
+
+
+# ---------------------------------------------------------------------------
 # Fontes de vagas conhecidas
 # ---------------------------------------------------------------------------
 FONTES_VAGAS = {
@@ -314,6 +336,16 @@ PALAVRAS_NAO_VAGA = [
     # Programas de capacitação
     "generation brasil", "lista de interesse", "lista de espera",
     "lista de candidatos",
+
+    # [FIX] Oportunidades de aprendizado de bancos/instituições (ex.: Info
+    # Santander / Santander Universidades) — não são vagas, são comunicados
+    # sobre cursos/capacitação e devem cair em "Comunicados".
+    "info santander", "santander universidades", "universidades santander",
+    "trilha de carreira", "capacitação gratuita", "conteúdo gratuito",
+    "workshop gratuito", "inscreva-se no curso", "bolsa de estudo",
+
+    # Confirmações que NÃO são de vaga de emprego
+    "confirmação de inscrição",  # inscrição em curso/evento, não candidatura de vaga
 
     # Marketing / promoções
     "oferta do dia", "promoção", "desconto", "newsletter",
@@ -523,7 +555,13 @@ def _limpar_html(texto: str) -> str:
         return ""
     texto = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", texto, flags=re.DOTALL | re.IGNORECASE)
     texto = re.sub(r"[a-zA-Z][a-zA-Z0-9_\-\s,.#:>+*]*\{[^{}]{1,500}\}", " ", texto)
-    texto = re.sub(r"<\s*(br|/p|/div|/li|/tr|/h\d)\s*/?>", "\n", texto, flags=re.IGNORECASE)
+    # [FIX] Converte tanto ABERTURA quanto fechamento de br/p/div/li/tr/td/
+    # table/h1-6 em quebra de linha. Muitos e-mails de vaga (ex.: Catho) são
+    # montados com <table>/<tr>/<td>, e é a tag de ABERTURA que realmente
+    # separa "Cargo" de "Empresa" visualmente. Convertendo só o fechamento
+    # (como antes), cargo e empresa ficavam colados (ex.: "Analista
+    # AdministrativoHIRING"), quebrando a extração de cargo/empresa/link.
+    texto = re.sub(r"<\s*/?\s*(br|p|div|li|tr|td|table|h\d)\b[^>]*>", "\n", texto, flags=re.IGNORECASE)
     texto = re.sub(r"<[^>]+>", "", texto)
     texto = unescape(texto)
     texto = re.sub(r"/\*.*?\*/", "", texto, flags=re.DOTALL)
@@ -539,7 +577,17 @@ def _normalizar(texto: str) -> str:
     return "\n".join(l.rstrip() for l in texto.split("\n")).strip()
 
 
-def extrair_corpo(payload: dict) -> str:
+def _extrair_corpo_e_html(payload: dict) -> tuple[str, str]:
+    """
+    Retorna (corpo_limpo, html_bruto).
+
+    [FIX] O html_bruto preserva os hrefs originais das tags <a>. Isso é
+    essencial: depois que _limpar_html remove as tags, o href some junto
+    — então quem consumia só o corpo limpo (Gemini/heurística) nunca tinha
+    acesso ao link real de candidatura, e "chutava" URLs (Indeed/Jobbol,
+    gerando links quebrados) ou não achava nada (Catho/InfoJobs, que
+    escondem a URL real atrás de um botão, nunca em texto puro).
+    """
     plain, html = "", ""
 
     def walk(parts):
@@ -564,7 +612,14 @@ def extrair_corpo(payload: dict) -> str:
         elif mime == "text/html" and data:
             html = _decode_b64(data)
 
-    return _normalizar(_limpar_html(plain or html))
+    corpo_limpo = _normalizar(_limpar_html(plain or html))
+    return corpo_limpo, html
+
+
+def extrair_corpo(payload: dict) -> str:
+    """Mantido por compatibilidade — retorna só o texto limpo."""
+    corpo, _ = _extrair_corpo_e_html(payload)
+    return corpo
 
 
 def _header(headers: list, name: str, default: str = "") -> str:
@@ -590,12 +645,153 @@ def _extrair_tecnologias(texto: str) -> list:
     return list(dict.fromkeys(encontradas))
 
 
-def _extrair_link_candidatura(corpo: str, remetente: str = "") -> str | None:
+# ---------------------------------------------------------------------------
+# [FIX] Extração de âncoras reais do HTML (texto visível + href) e
+# resolução do redirecionador de tracking da Catho.
+# ---------------------------------------------------------------------------
+
+_PADROES_LINK_IGNORAR = [
+    "unsubscribe", "descadastr", "opt-out", "optout",
+    "preferences", "manage-preferences", "manage_preferences",
+    "mailto:", "tel:", "sms:",
+    "mcauto-images", "sendgrid.net", "sendgrid.com",
+    "/track/", "/pixel", "/beacon", "/open/",
+    "view-online", "view_online", "view_in_browser", "web-view",
+    "privacy", "terms-of-service", "policy",
+    "instagram.com", "facebook.com", "twitter.com", "youtube.com",
+    "linkedin.com/in/", "wa.me/",
+]
+
+_PALAVRAS_DESCADASTRO_TEXTO = [
+    "cancelar", "descadastrar", "unsubscribe",
+    "parar de receber", "não receber mais", "preferências", "remover",
+]
+
+
+def _resolver_link_real(href: str) -> str:
     """
-    Extrai o link mais relevante da vaga no corpo do e-mail.
-    Prioridade: link direto da vaga > link de candidatura > primeiro link do corpo.
-    Descarta links de rastreamento (tracking pixels, unsubscribe, etc.).
+    A Catho não linka direto para a vaga: embrulha a URL real dentro de um
+    link de tracking próprio (channel-tracking/.../clicked?i=<payload
+    base64 com {"r": "<url real>"}>). Sem desembrulhar isso, o link salvo
+    é sempre o mesmo redirecionador genérico — que pode nem existir mais
+    quando o usuário for clicar depois. Se não for esse formato, devolve
+    o href original.
     """
+    try:
+        parsed = urllib.parse.urlparse(href)
+        if "catho.com.br" in parsed.netloc and "channel-tracking" in parsed.path:
+            qs = urllib.parse.parse_qs(parsed.query)
+            payload = qs.get("i", [None])[0]
+            if payload:
+                pad = "=" * (-len(payload) % 4)
+                decodificado = base64.urlsafe_b64decode(payload + pad)
+                dados = json.loads(decodificado)
+                destino = dados.get("r")
+                if destino:
+                    return destino
+    except Exception:
+        pass
+    return href
+
+
+def _extrair_ancoras(html: str) -> list[dict]:
+    """
+    [FIX] Extrai pares {"texto", "url"} do HTML ORIGINAL do e-mail — é aqui
+    que o link de candidatura de verdade mora. Depois que o corpo passa por
+    _limpar_html, os hrefs somem junto com a tag <a>, então o Gemini (e o
+    fallback heurístico) ficavam só com o texto puro: para Indeed/Jobbol
+    isso gerava links "chutados" e quebrados; para Catho/InfoJobs, que
+    escondem a URL real atrás de um botão (nunca aparece como texto puro),
+    o resultado era nenhum link.
+    """
+    if not html:
+        return []
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return []
+
+    vistos: set[str] = set()
+    ancoras: list[dict] = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href.startswith(("http://", "https://")):
+            continue
+        if any(p in href.lower() for p in _PADROES_LINK_IGNORAR):
+            continue
+
+        texto = " ".join(a.get_text(" ", strip=True).split())
+        if any(p in texto.lower() for p in _PALAVRAS_DESCADASTRO_TEXTO):
+            continue
+
+        href_real = _resolver_link_real(href)
+        if href_real in vistos:
+            continue
+        vistos.add(href_real)
+        ancoras.append({"texto": texto or "(sem texto)", "url": href_real})
+
+    return ancoras
+
+
+def _normalizar_para_match(texto: str) -> str:
+    """Minúsculas, sem acento/pontuação — para comparar cargo x texto de link com tolerância."""
+    if not texto:
+        return ""
+    texto = texto.lower().strip()
+    texto = "".join(c for c in unicodedata.normalize("NFKD", texto) if not unicodedata.combining(c))
+    texto = re.sub(r"[^a-z0-9 ]", " ", texto)
+    return re.sub(r"\s+", " ", texto).strip()
+
+
+def _achar_ancora_por_cargo(cargo: str, ancoras: list[dict], usadas: set) -> str | None:
+    """
+    Casa o cargo de uma vaga com a âncora cujo texto visível corresponde a
+    ele — em vez de assumir que a N-ésima vaga corresponde ao N-ésimo link
+    (que quebra sempre que a ordem/contagem diverge, comum em digests com
+    várias vagas no mesmo e-mail, como Indeed e Catho).
+    """
+    alvo = _normalizar_para_match(cargo)
+    if not alvo:
+        return None
+    for i, a in enumerate(ancoras):
+        if i in usadas:
+            continue
+        texto_a = _normalizar_para_match(a["texto"])
+        if not texto_a:
+            continue
+        if texto_a == alvo or texto_a.startswith(alvo) or alvo.startswith(texto_a):
+            usadas.add(i)
+            return a["url"]
+    for i, a in enumerate(ancoras):
+        if i in usadas:
+            continue
+        texto_a = _normalizar_para_match(a["texto"])
+        if texto_a and (texto_a in alvo or alvo in texto_a):
+            usadas.add(i)
+            return a["url"]
+    return None
+
+
+def _extrair_link_candidatura(corpo: str, remetente: str = "", ancoras: list[dict] | None = None) -> str | None:
+    """
+    Extrai o link mais relevante da vaga.
+
+    [FIX] Prioriza as âncoras reais do HTML (texto do link + href), que é
+    onde o link de candidatura de fato mora — o corpo (já limpo de tags)
+    normalmente não contém nenhuma URL para Catho/InfoJobs. Só cai para o
+    regex em texto puro (comportamento antigo) quando não há âncoras.
+    """
+    if ancoras:
+        prioridade_texto = [
+            "candidatar", "candidatura", "vaga", "apply", "ver vaga",
+            "enviar currículo", "enviar curriculo", "quero esta vaga",
+            "inscreva-se", "saiba mais", "ver detalhes",
+        ]
+        for a in ancoras:
+            if any(p in a["texto"].lower() for p in prioridade_texto):
+                return a["url"]
+        return ancoras[0]["url"]
+
     if not corpo:
         return None
 
@@ -897,15 +1093,139 @@ def _gerar_gemini(prompt: str, max_tentativas: int = 3) -> str:
     return _rota_ia_chamar_ia(prompt, max_tentativas=max_tentativas)
 
 
-def _parse_gemini_json(raw: str, esperado_dict: bool = True) -> dict:
+# ---------------------------------------------------------------------------
+# [FIX] Parse robusto de JSON vindo da IA.
+#
+# O erro de parse acontecia por dois motivos:
+#   1) A IA envolve a resposta em cercas de markdown (```json ... ```) ou
+#      adiciona texto solto antes/depois ("Aqui está o resultado:").
+#   2) A resposta é cortada no meio (limite de tokens), deixando chaves/
+#      colchetes sem fechar — json.loads falha e a vaga/e-mail inteiro
+#      era descartado, mesmo quando dava para aproveitar parte dos dados.
+# ---------------------------------------------------------------------------
+
+INSTRUCAO_JSON_PURO = (
+    "\n\nFORMATO DE RESPOSTA — MUITO IMPORTANTE:\n"
+    "Responda em RAW JSON — comece a resposta direto com { ou [ e termine "
+    "com } ou ]. NÃO use crases (```), NÃO use ```json, NÃO escreva nenhum "
+    "texto antes ou depois do JSON (sem \"aqui está\", sem explicações). "
+    "Se a lista for longa, prefira encurtar textos (ex.: descrição/resumo) "
+    "a deixar o JSON incompleto — a resposta precisa terminar fechada."
+)
+
+
+def _tentar_reparar_json_truncado(texto: str):
+    """
+    Tenta recuperar dados de um JSON cortado no meio (resposta truncada
+    pelo limite de tokens). Encontra os pontos onde a estrutura ainda
+    estava balanceada até aquele momento, fecha as chaves/colchetes
+    pendentes e tenta json.loads — dos cortes mais tardios (menos perda
+    de dados) para os mais cedo, até um deles parsear com sucesso.
+    Retorna o objeto parseado, ou None se não for recuperável.
+    """
+    if not texto or texto[0] not in "{[":
+        return None
+
+    # Localiza todas as vírgulas "de verdade" (fora de strings)
+    posicoes_virgula = []
+    dentro_string = False
+    escape = False
+    for i, ch in enumerate(texto):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and dentro_string:
+            escape = True
+            continue
+        if ch == '"':
+            dentro_string = not dentro_string
+            continue
+        if not dentro_string and ch == ",":
+            posicoes_virgula.append(i)
+
+    def _pilha_ate(pos: int) -> list:
+        pilha = []
+        dentro = False
+        esc = False
+        for ch in texto[:pos]:
+            if esc:
+                esc = False
+                continue
+            if ch == "\\" and dentro:
+                esc = True
+                continue
+            if ch == '"':
+                dentro = not dentro
+                continue
+            if dentro:
+                continue
+            if ch in "{[":
+                pilha.append(ch)
+            elif ch in "}]" and pilha:
+                pilha.pop()
+        return pilha
+
+    fechamentos = {"{": "}", "[": "]"}
+    for corte in reversed(posicoes_virgula):
+        pilha = _pilha_ate(corte)
+        if not pilha:
+            continue
+        sufixo = "".join(fechamentos[c] for c in reversed(pilha))
+        try:
+            return json.loads(texto[:corte] + sufixo)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _limpar_e_parsear_json(raw: str):
+    """
+    Limpa a string bruta da IA (remove cercas de markdown, isola o maior
+    bloco JSON válido descartando prosa ao redor, remove vírgulas soltas)
+    e só então roda json.loads — com uma última tentativa de reparo caso
+    a resposta tenha sido cortada. Nunca levanta exceção: retorna {} se
+    não for recuperável de jeito nenhum.
+    """
     if not raw:
         return {}
-    raw = re.sub(r"```(?:json)?", "", raw).strip(" `\n")
+
+    texto = raw.strip()
+    texto = re.sub(r"```(?:json)?\s*", "", texto, flags=re.IGNORECASE)
+    texto = texto.replace("```", "").strip()
+
+    # Isola do primeiro '{'/'[' ao último '}'/']' — descarta qualquer
+    # texto explicativo que a IA tenha colocado antes/depois do JSON.
+    inicio = next((i for i, c in enumerate(texto) if c in "{["), None)
+    if inicio is not None:
+        fecha = "}" if texto[inicio] == "{" else "]"
+        fim = texto.rfind(fecha)
+        if fim != -1 and fim > inicio:
+            texto = texto[inicio:fim + 1]
+
     try:
-        parsed = json.loads(raw)
+        return json.loads(texto)
     except json.JSONDecodeError:
-        Log.warn(f"  Gemini JSON inválido: {raw[:80]}...")
-        return {}
+        pass
+
+    # Remove vírgulas soltas antes de } ou ] (erro comum do modelo)
+    texto_sem_virgula_solta = re.sub(r",\s*([}\]])", r"\1", texto)
+    try:
+        return json.loads(texto_sem_virgula_solta)
+    except json.JSONDecodeError:
+        pass
+
+    # Última tentativa: resposta truncada — recupera o que der
+    reparado = _tentar_reparar_json_truncado(texto_sem_virgula_solta)
+    if reparado is not None:
+        Log.warn("  ⚠ JSON da IA veio truncado — dados parciais recuperados")
+        return reparado
+
+    Log.warn(f"  Gemini JSON inválido (irrecuperável): {raw[:80]}...")
+    return {}
+
+
+def _parse_gemini_json(raw: str, esperado_dict: bool = True) -> dict:
+    parsed = _limpar_e_parsear_json(raw)
     if isinstance(parsed, dict):
         return parsed
     if isinstance(parsed, list):
@@ -989,7 +1309,7 @@ def classificar_email_pipeline(assunto: str, remetente: str, corpo_preview: str,
 
 
 def extrair_vagas_pipeline(assunto: str, remetente: str, corpo: str,
-                           msg_id: str = "") -> list[dict]:
+                           msg_id: str = "", ancoras: list[dict] | None = None) -> list[dict]:
     """
     Etapa 2: extrai N vagas de um e-mail.
 
@@ -997,6 +1317,12 @@ def extrair_vagas_pipeline(assunto: str, remetente: str, corpo: str,
       1. Cache local   — reutiliza resultado anterior
       2. Gemini        — só se houver budget de vagas
       3. Fallback      — heurística simples, retorna 1 item sem score
+
+    [FIX] `ancoras` (texto do link + href real, extraído do HTML original)
+    é repassado ao Gemini via `links_html` para que ele associe cada vaga
+    ao link correto, em vez de "chutar" uma URL a partir do texto puro
+    (que nunca contém o href para Catho/InfoJobs, e gerava links
+    quebrados quando "adivinhados" para Indeed/Jobbol).
 
     Cada item da lista tem: cargo, empresa, local, modelo_trabalho,
     salario, link_candidatura, requisitos, tecnologias, score_match,
@@ -1015,7 +1341,7 @@ def extrair_vagas_pipeline(assunto: str, remetente: str, corpo: str,
     if _tem_budget("vagas"):
         if _GEMINI_SERVICE_OK:
             try:
-                resultado = _gs_extrair_vagas(assunto, remetente, corpo)
+                resultado = _gs_extrair_vagas(assunto, remetente, corpo, links_html=ancoras)
                 _consumir_budget("vagas")
                 if chave and resultado:
                     _GEMINI_CACHE[chave] = resultado
@@ -1039,7 +1365,7 @@ def extrair_vagas_pipeline(assunto: str, remetente: str, corpo: str,
                 "requisitos":         dados.get("requisitos_obrigatorios", []),
                 "tecnologias":        dados.get("tecnologias", []),
                 "score_match":        int(dados.get("score_match") or 0),
-                "link_candidatura":   None,
+                "link_candidatura":   _extrair_link_candidatura(corpo, remetente, ancoras),
                 "tipo_email":         "nova_vaga",
                 "status_candidatura": "nova",
             }]
@@ -1054,7 +1380,7 @@ def extrair_vagas_pipeline(assunto: str, remetente: str, corpo: str,
         # Budget esgotado — heurística local pura (0 tokens)
         Log.warn(f"  ⚠ Budget Gemini/vagas esgotado ({_GEMINI_BUDGET.get('vagas',0)}/{_BUDGET_LIMITE['vagas']}) — usando heurística")
         techs = _extrair_tecnologias(corpo)
-        link  = _extrair_link_candidatura(corpo, remetente)
+        link  = _extrair_link_candidatura(corpo, remetente, ancoras)
         return [{
             "cargo":              assunto,
             "empresa":            "Não identificada (sem Gemini)",
@@ -1158,6 +1484,7 @@ Analise o texto abaixo e responda APENAS em JSON estrito (sem crases):
 }}
 Texto:
 {texto[:3000]}
+{INSTRUCAO_JSON_PURO}
 """
     try:
         raw = _gerar_gemini(prompt)
@@ -1181,6 +1508,7 @@ Analise o e-mail e responda APENAS em JSON estrito (sem crases):
 Remetente: {remetente}
 Assunto: {assunto}
 Corpo: {corpo[:800]}
+{INSTRUCAO_JSON_PURO}
 """
     try:
         raw = _gerar_gemini(prompt)
@@ -1226,7 +1554,14 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
         assunto   = _header(headers, "Subject", "Sem Assunto")
         remetente = _header(headers, "From",    "Desconhecido")
         data      = _header(headers, "Date",    "")
-        corpo     = extrair_corpo(detalhe["payload"])
+
+        # ── [FIX] Ignora 100% e-mails do próprio AutoApply AI (grátis, antes da IA) ──
+        if _eh_email_proprio(assunto, remetente):
+            Log.info(f"  ⏭ Ignorado (e-mail do próprio AutoApply AI): {assunto[:50]}")
+            continue
+
+        corpo, html_bruto = _extrair_corpo_e_html(detalhe["payload"])
+        ancoras = _extrair_ancoras(html_bruto)
 
         # ── Etapa 1: classificar o e-mail (barato, usa heurística primeiro) ──
         categoria = classificar_email_pipeline(assunto, remetente, corpo[:400], msg["id"])
@@ -1238,7 +1573,7 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
 
         # ── Etapa 2: extrair vagas (suporta múltiplas por e-mail) ─────────────
         Log.info(f"  Extraindo vagas de: {assunto[:60]}")
-        vagas_extraidas = extrair_vagas_pipeline(assunto, remetente, corpo, msg["id"])
+        vagas_extraidas = extrair_vagas_pipeline(assunto, remetente, corpo, msg["id"], ancoras=ancoras)
 
         if not vagas_extraidas:
             Log.warn(f"  Nenhuma vaga extraída de: {assunto[:50]}")
@@ -1247,6 +1582,7 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
         Log.info(f"  {len(vagas_extraidas)} vaga(s) encontrada(s) neste e-mail")
 
         score_max = 0
+        ancoras_usadas: set = set()
         for vaga_raw in vagas_extraidas:
             # Enriquece com tecnologias detectadas heuristicamente
             techs_h  = _extrair_tecnologias(corpo)
@@ -1256,8 +1592,16 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
             score    = vaga_raw.get("score_match", 0) or 0
             score_max = max(score_max, score)
 
-            # Usa o link extraído pelo Gemini; fallback para extração heurística
-            link = vaga_raw.get("link_candidatura") or _extrair_link_candidatura(corpo, remetente)
+            # [FIX] Prioridade do link: 1) o que o Gemini já escolheu entre
+            # as âncoras reais fornecidas; 2) casar o cargo desta vaga
+            # específica com a âncora de texto correspondente (essencial
+            # em digests com N vagas no mesmo e-mail, ex.: Catho/Indeed);
+            # 3) fallback heurístico geral.
+            link = (
+                vaga_raw.get("link_candidatura")
+                or _achar_ancora_por_cargo(vaga_raw.get("cargo") or assunto, ancoras, ancoras_usadas)
+                or _extrair_link_candidatura(corpo, remetente, ancoras)
+            )
 
             vaga = {
                 "email_id":          msg["id"],
@@ -1759,6 +2103,7 @@ Analise o e-mail abaixo e responda APENAS em JSON estrito (sem crases):
 Remetente: {remetente}
 Assunto: {assunto}
 Corpo: {corpo[:800]}
+{INSTRUCAO_JSON_PURO}
 """))
 
 
@@ -1842,6 +2187,12 @@ def rodar_emails_gerais(service, labels: dict, sb: Client | None, query: str, dr
         assunto   = _header(headers, "Subject", "Sem Assunto")
         remetente = _header(headers, "From",    "Desconhecido")
         data      = _header(headers, "Date",    "")
+
+        # ── [FIX] Ignora 100% e-mails do próprio AutoApply AI (grátis, antes da IA) ──
+        if _eh_email_proprio(assunto, remetente):
+            Log.info(f"  ⏭ Ignorado (e-mail do próprio AutoApply AI): {assunto[:50]}")
+            continue
+
         corpo     = extrair_corpo(detalhe["payload"])
 
         # 1. Classificação heurística (rápida, sem token)
