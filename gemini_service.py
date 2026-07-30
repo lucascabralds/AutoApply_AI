@@ -56,17 +56,126 @@ def _chamar_gemini(prompt: str, max_tentativas: int = 3) -> str:
     return _chamar_rota_ia(prompt, max_tentativas=max_tentativas)
 
 
+# ---------------------------------------------------------------------------
+# [FIX] Parse robusto de JSON vindo da IA.
+#
+# O erro de parse acontecia por dois motivos: (1) a IA envolve a resposta
+# em cercas de markdown ou texto solto ao redor ("Aqui está:"), e (2) a
+# resposta é cortada no meio pelo limite de tokens, deixando chaves/
+# colchetes sem fechar. Antes, qualquer um dos dois derrubava o
+# json.loads e a vaga/e-mail inteiro era descartado.
+# ---------------------------------------------------------------------------
+
+INSTRUCAO_JSON_PURO = (
+    "\n\nFORMATO DE RESPOSTA — MUITO IMPORTANTE:\n"
+    "Responda em RAW JSON — comece a resposta direto com { ou [ e termine "
+    "com } ou ]. NÃO use crases (```), NÃO use ```json, NÃO escreva nenhum "
+    "texto antes ou depois do JSON (sem \"aqui está\", sem explicações). "
+    "Se a lista for longa, prefira encurtar textos (ex.: descrição/resumo) "
+    "a deixar o JSON incompleto — a resposta precisa terminar fechada."
+)
+
+
+def _tentar_reparar_json_truncado(texto: str):
+    """
+    Recupera dados de um JSON cortado no meio (resposta truncada pelo
+    limite de tokens): acha pontos onde a estrutura ainda estava
+    balanceada, fecha o que ficou pendente e tenta json.loads — dos
+    cortes mais tardios (menor perda de dados) para os mais cedo.
+    """
+    if not texto or texto[0] not in "{[":
+        return None
+
+    posicoes_virgula = []
+    dentro_string = False
+    escape = False
+    for i, ch in enumerate(texto):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and dentro_string:
+            escape = True
+            continue
+        if ch == '"':
+            dentro_string = not dentro_string
+            continue
+        if not dentro_string and ch == ",":
+            posicoes_virgula.append(i)
+
+    def _pilha_ate(pos: int) -> list:
+        pilha = []
+        dentro = False
+        esc = False
+        for ch in texto[:pos]:
+            if esc:
+                esc = False
+                continue
+            if ch == "\\" and dentro:
+                esc = True
+                continue
+            if ch == '"':
+                dentro = not dentro
+                continue
+            if dentro:
+                continue
+            if ch in "{[":
+                pilha.append(ch)
+            elif ch in "}]" and pilha:
+                pilha.pop()
+        return pilha
+
+    fechamentos = {"{": "}", "[": "]"}
+    for corte in reversed(posicoes_virgula):
+        pilha = _pilha_ate(corte)
+        if not pilha:
+            continue
+        sufixo = "".join(fechamentos[c] for c in reversed(pilha))
+        try:
+            return json.loads(texto[:corte] + sufixo)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
 def _parse_json(raw: str) -> dict | list:
     """Converte texto bruto do Gemini em dict ou list de forma segura."""
     if not raw:
         return {}
-    # Remove possíveis backticks de markdown
-    raw = re.sub(r"```(?:json)?", "", raw).strip(" `\n")
+
+    texto = raw.strip()
+    # Remove cercas de markdown (```json ... ``` ou ``` ... ```)
+    texto = re.sub(r"```(?:json)?\s*", "", texto, flags=re.IGNORECASE)
+    texto = texto.replace("```", "").strip()
+
+    # Isola do primeiro '{'/'[' ao último '}'/']' — descarta qualquer
+    # texto explicativo que a IA tenha colocado antes/depois do JSON.
+    inicio = next((i for i, c in enumerate(texto) if c in "{["), None)
+    if inicio is not None:
+        fecha = "}" if texto[inicio] == "{" else "]"
+        fim = texto.rfind(fecha)
+        if fim != -1 and fim > inicio:
+            texto = texto[inicio:fim + 1]
+
     try:
-        return json.loads(raw)
+        return json.loads(texto)
     except json.JSONDecodeError:
-        logger.warning(f"Gemini JSON inválido: {raw[:100]}")
-        return {}
+        pass
+
+    # Remove vírgulas soltas antes de } ou ] (erro comum do modelo)
+    texto_sem_virgula_solta = re.sub(r",\s*([}\]])", r"\1", texto)
+    try:
+        return json.loads(texto_sem_virgula_solta)
+    except json.JSONDecodeError:
+        pass
+
+    # Última tentativa: resposta truncada — recupera o que der
+    reparado = _tentar_reparar_json_truncado(texto_sem_virgula_solta)
+    if reparado is not None:
+        logger.warning("JSON da IA veio truncado — dados parciais recuperados")
+        return reparado
+
+    logger.warning(f"Gemini JSON inválido (irrecuperável): {raw[:100]}")
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +211,14 @@ _PALAVRAS_NAO_VAGA = [
     "curso", "bootcamp", "treinamento", "mentoria", "webinar",
     "desconto", "promoção", "oferta", "newsletter", "comunidade",
     "você ganhou", "certificado chegou", "ganhou certificado",
+    # [FIX] Oportunidades de aprendizado de bancos/instituições (ex.: Info
+    # Santander / Santander Universidades) — são comunicados sobre cursos
+    # e capacitação, não vagas de emprego. Sem isso, a heurística deste
+    # arquivo (que roda antes do prompt do Gemini) classificava esses
+    # e-mails como "vaga" por conterem palavras como "oportunidade".
+    "santander universidades", "info santander", "trilha de carreira",
+    "trilha de aprendizado", "capacitação gratuita", "bolsa de estudo",
+    "inscreva-se no curso",
 ]
 
 
@@ -145,7 +262,7 @@ def classificar_email(assunto: str, remetente: str, corpo_preview: str) -> str:
     prompt = f"""
 Você é um classificador de e-mails.
 Classifique o e-mail abaixo em UMA das categorias:
-  vaga        — oferta de emprego real
+  vaga        — oferta de emprego real, com cargo/empresa contratando
   certificado — notificação de conclusão de curso / entrega de certificado
   alerta      — código OTP, alerta de login, recuperação de senha
   agendamento — confirmação de horário, reserva, consulta médica
@@ -153,12 +270,20 @@ Classifique o e-mail abaixo em UMA das categorias:
   servico     — newsletter, promoção, atualização de app, e-mail de marketing
   outro       — qualquer outro tipo
 
+IMPORTANTE — não confunda oportunidade de APRENDIZADO com oportunidade de
+EMPREGO: e-mails de bancos/instituições oferecendo cursos, trilhas de
+capacitação, workshops ou bolsas de estudo (ex.: "Info Santander",
+"Santander Universidades") NÃO são vaga, mesmo que usem palavras como
+"oportunidade" — classifique como "servico" (serão tratados como
+Comunicado no restante do pipeline).
+
 Responda APENAS em JSON estrito (sem crases):
 {{"categoria": "<uma das 7 acima>", "justificativa": "1 frase curta"}}
 
 Remetente: {remetente}
 Assunto: {assunto}
 Prévia: {corpo_preview[:400]}
+{INSTRUCAO_JSON_PURO}
 """
     try:
         raw = _chamar_gemini(prompt)
@@ -242,6 +367,7 @@ Remetente: {remetente}
 Assunto: {assunto}
 Corpo do e-mail:
 {corpo[:3500]}
+{INSTRUCAO_JSON_PURO}
 """
     try:
         raw = _chamar_gemini(prompt)
@@ -325,6 +451,7 @@ Regras:
 Remetente: {remetente}
 Assunto: {assunto}
 Corpo: {corpo[:800]}
+{INSTRUCAO_JSON_PURO}
 """
     try:
         raw = _chamar_gemini(prompt)
@@ -370,6 +497,7 @@ Analise o e-mail e responda APENAS em JSON estrito (sem crases):
 Remetente: {remetente}
 Assunto: {assunto}
 Corpo: {corpo[:800]}
+{INSTRUCAO_JSON_PURO}
 """
     try:
         raw = _chamar_gemini(prompt)
