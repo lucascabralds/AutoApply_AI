@@ -62,6 +62,7 @@ from googleapiclient.http import MediaIoBaseUpload
 import google_auth
 from notificador import enviar_telegram, escapar_html, telegram_configurado
 from seguranca import redigir_segredo
+from services.gmail.add_task import criar_tarefa_vaga
 
 # ---------------------------------------------------------------------------
 # Supabase
@@ -1300,7 +1301,8 @@ def notificar_vaga(vaga: dict) -> None:
     enviar_telegram("\n".join(linhas))
 
 
-def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: bool):
+def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: bool,
+                tasks_service=None):
     Log.section("Módulo 1 — Extração de Vagas")
 
     # Pula e-mails que qualquer módulo já etiquetou — antes, todo e-mail da
@@ -1418,6 +1420,8 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
 
             if score >= SCORE_NOTIFICAR_VAGA and tipo == "nova_vaga" and not dry_run:
                 notificar_vaga(vaga)
+                if tasks_service and criar_tarefa_vaga(tasks_service, vaga):
+                    Log.ok("      ✅ Follow-up criado no Google Tasks")
 
             time.sleep(0.5)  # throttle entre vagas do mesmo e-mail
 
@@ -2070,13 +2074,14 @@ def main():
 
     labels = garantir_labels(service)
     sb = None if args.dry_run else criar_supabase()
+    tasks_service = google_auth.construir_servicos("tasks")[0] if google_auth.TASKS_ENABLED else None
 
     rodar_todos = args.modulo == "todos"
 
     def executar_ciclo() -> list:
         modulos_rodados = []
         if rodar_todos or args.modulo == "vagas":
-            rodar_vagas(service, labels, sb, query, args.dry_run)
+            rodar_vagas(service, labels, sb, query, args.dry_run, tasks_service)
             modulos_rodados.append("vagas")
 
         if rodar_todos or args.modulo == "certificados":

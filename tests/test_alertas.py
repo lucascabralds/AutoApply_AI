@@ -42,3 +42,31 @@ def test_notificar_vaga_monta_mensagem(monkeypatch):
     })
     assert "Dev Python &lt;Jr&gt;" in enviadas[0]
     assert 'href="https://x.com/v?a=1&amp;b=2"' in enviadas[0]
+
+
+def test_tarefa_de_follow_up_da_vaga():
+    from services.gmail import add_task
+
+    class _Tasks:
+        def __init__(self):
+            self.corpos = []
+
+        def tasks(self):
+            return self
+
+        def insert(self, tasklist, body):
+            self.corpos.append((tasklist, body))
+            return self
+
+        def execute(self):
+            return {"id": "t1"}
+
+    servico = _Tasks()
+    vaga = {"cargo": "Dev Python", "empresa": "ACME", "score_gemini": 90,
+            "modelo_trabalho": "Remoto", "link_candidatura": "https://x.com/v"}
+    assert add_task.criar_tarefa_vaga(servico, vaga) == "t1"
+    lista, corpo = servico.corpos[0]
+    assert lista == "@default"
+    assert corpo["title"] == "Candidatar: Dev Python @ ACME"
+    assert "https://x.com/v" in corpo["notes"]
+    assert corpo["due"].endswith("T00:00:00.000Z")
