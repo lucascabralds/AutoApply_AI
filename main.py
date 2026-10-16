@@ -593,6 +593,30 @@ def _iterar_partes(payload: dict):
         yield from _iterar_partes(parte)
 
 
+def _eh_inline(parte: dict) -> bool:
+    """Imagem embutida no corpo (logo, assinatura): tem Content-ID ou disposition inline."""
+    headers = {h["name"].lower(): h["value"].lower() for h in parte.get("headers", [])}
+    return "content-id" in headers or headers.get("content-disposition", "").startswith("inline")
+
+
+def _anexos_certificado(partes: list[dict]) -> list[dict]:
+    """
+    Anexos candidatos a certificado, na ordem de preferência: PDFs, depois
+    imagens/arquivos anexados de verdade. Imagens inline (logo do e-mail
+    dentro de multipart/related) ficam de fora — a busca em profundidade
+    chegava nelas antes do PDF e a logo ia para o Drive como "certificado".
+    """
+    anexos = [p for p in partes if p.get("filename")]
+
+    def prioridade(p):
+        mime = p.get("mimeType", "")
+        if mime == "application/pdf" or p["filename"].lower().endswith(".pdf"):
+            return 0
+        return 1
+
+    return sorted((p for p in anexos if not _eh_inline(p)), key=prioridade)
+
+
 def _listar_mensagens(service, query: str, limite: int) -> list[dict]:
     """
     messages.list com paginação. A API devolve no máximo uma página por
@@ -856,9 +880,17 @@ _SCHEMA_VAGAS_V3: bool | None = None
 
 
 def _erro_de_schema(exc: Exception) -> bool:
-    """Coluna inexistente (PGRST204) ou falta do índice único de vaga_uid (42P10)."""
+    """
+    Só erros que indicam banco SEM a migração v3: coluna inexistente
+    (PGRST204 / 42703) ou falta do índice único de vaga_uid (42P10).
+    Erros de dado ("null value in column", "value too long for column")
+    não podem desligar o formato novo para o resto da execução.
+    """
     msg = str(exc).lower()
-    return any(p in msg for p in ("schema cache", "pgrst204", "42p10", "column", "on conflict"))
+    return any(p in msg for p in (
+        "pgrst204", "schema cache", "42703", "42p10",
+        "no unique or exclusion constraint",
+    ))
 
 
 def salvar_vaga(sb: Client | None, vaga: dict, dry_run: bool = False) -> bool:
@@ -1084,10 +1116,13 @@ def _parsear_valor(texto) -> float | None:
         return None
     if isinstance(texto, (int, float)):
         return float(texto)
-    m = re.search(r"\d[\d.,]*", str(texto))
+    texto = str(texto)
+    # "3x de R$ 49,90" → o valor é o que vem depois do símbolo da moeda
+    moeda = re.search(r"(?:R\$|US\$|\$|€|USD|BRL)\s*(\d[\d.,]*)", texto, re.IGNORECASE)
+    m = moeda or re.search(r"\d[\d.,]*", texto)
     if not m:
         return None
-    num = m.group(0).rstrip(".,")
+    num = (moeda.group(1) if moeda else m.group(0)).rstrip(".,")
     if "," in num and "." in num:
         # o separador que aparece por último é o decimal
         if num.rfind(",") > num.rfind("."):
@@ -1392,10 +1427,10 @@ def classificar_geral_pipeline(remetente: str, assunto: str, corpo: str,
 # 7. MÓDULO DE VAGAS
 # ===========================================================================
 
-def notificar_vaga(vaga: dict) -> None:
+def notificar_vaga(vaga: dict) -> bool:
     """Push no Telegram para vagas de alta prioridade (no-op se não configurado)."""
     if not telegram_configurado():
-        return
+        return False
     linhas = [
         f"🔥 <b>{escapar_html(vaga['cargo'])}</b> — {vaga.get('score_gemini', 0)}%",
         escapar_html(f"{vaga['empresa']} · {vaga.get('modelo_trabalho') or 'Não informado'}"
@@ -1403,7 +1438,7 @@ def notificar_vaga(vaga: dict) -> None:
     ]
     if vaga.get("link_candidatura"):
         linhas.append(f'<a href="{escapar_html(vaga["link_candidatura"])}">Ver vaga</a>')
-    enviar_telegram("\n".join(linhas))
+    return enviar_telegram("\n".join(linhas))
 
 
 def preparar_rascunho_candidatura(service, vaga: dict, texto_email: str) -> str | None:
@@ -1440,6 +1475,44 @@ def preparar_rascunho_candidatura(service, vaga: dict, texto_email: str) -> str 
         return None
     _cache_set("rascunho", uid, rascunho_id or "ok")
     return rascunho_id
+
+
+def _uma_vez(acao: str, vaga: dict, executar) -> None:
+    """
+    Executa um efeito colateral (push, tarefa, rascunho) no máximo uma vez
+    por vaga — marcado no cache — e sem deixar uma exceção interromper o
+    resto do processamento do e-mail (que ainda precisa receber a label).
+    """
+    uid = _vaga_uid(vaga.get("email_id"), vaga.get("cargo"), vaga.get("empresa"))
+    if _cache_get(acao, uid, str):
+        return
+    try:
+        if executar():
+            _cache_set(acao, uid, "ok")
+    except Exception as e:
+        Log.warn(f"  {acao} falhou para '{vaga.get('cargo')}': {e}")
+
+
+def acoes_vaga_prioritaria(service, tasks_service, vaga: dict, texto_recrutador: str) -> None:
+    """Telegram + Google Tasks (score ≥ SCORE_NOTIFICAR_VAGA) e rascunho de candidatura."""
+    if vaga.get("tipo_email") != "nova_vaga":
+        return
+    if int(vaga.get("score_gemini") or 0) >= SCORE_NOTIFICAR_VAGA:
+        if telegram_configurado():
+            _uma_vez("notif", vaga, lambda: notificar_vaga(vaga))
+        if tasks_service:
+            def _tarefa():
+                if criar_tarefa_vaga(tasks_service, vaga):
+                    Log.ok("      ✅ Follow-up criado no Google Tasks")
+                    return True
+            _uma_vez("tarefa", vaga, _tarefa)
+    if candidatura.deve_gerar_rascunho(vaga):
+        # preparar_rascunho_candidatura já marca "rascunho" no cache; aqui só isola exceções
+        try:
+            if preparar_rascunho_candidatura(service, vaga, texto_recrutador):
+                Log.ok("      ✉️  Rascunho de candidatura criado no Gmail")
+        except Exception as e:
+            Log.warn(f"  rascunho falhou para '{vaga.get('cargo')}': {e}")
 
 
 def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: bool,
@@ -1573,17 +1646,11 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
             lk   = f" → {link[:50]}" if link else ""
             Log.ok(f"    {flag} [{tipo}] {vaga['cargo']} @ {vaga['empresa']} — score {score}%{lk}")
 
-            if score >= SCORE_NOTIFICAR_VAGA and tipo == "nova_vaga" and not dry_run:
-                notificar_vaga(vaga)
-                if tasks_service and criar_tarefa_vaga(tasks_service, vaga):
-                    Log.ok("      ✅ Follow-up criado no Google Tasks")
-
-            if candidatura.deve_gerar_rascunho(vaga) and not dry_run:
+            if not dry_run:
                 # Num digest o e-mail do recrutador não é confiável por vaga
                 mailtos = " ".join(re.findall(r'mailto:([^"?\s>]+)', html_bruto or ""))
                 texto_recrutador = f"{corpo} {mailtos}" if len(vagas_extraidas) == 1 else ""
-                if preparar_rascunho_candidatura(service, vaga, texto_recrutador):
-                    Log.ok("      ✉️  Rascunho de candidatura criado no Gmail")
+                acoes_vaga_prioritaria(service, tasks_service, vaga, texto_recrutador)
 
             time.sleep(0.5)  # throttle entre vagas do mesmo e-mail
 
@@ -1772,10 +1839,8 @@ def rodar_certificados(service, drive_service, labels: dict, sb: Client | None,
         caminho_resultado = ""
         plataforma_cert   = "desconhecido"   # será sobrescrito na extração
 
-        # --- Parte A: anexos diretos ---
-        for parte in partes:
-            if not parte.get("filename"):
-                continue
+        # --- Parte A: anexos diretos (PDF primeiro; logos inline ignoradas) ---
+        for parte in _anexos_certificado(partes):
             dados_b64 = parte["body"].get("data", "")
             if not dados_b64 and parte["body"].get("attachmentId"):
                 try:

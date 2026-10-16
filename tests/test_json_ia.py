@@ -42,3 +42,12 @@ def test_carta_falha_retorna_vazio(monkeypatch):
         raise RuntimeError("gateway")
     monkeypatch.setattr(gemini_service, "_chamar_gemini", falha)
     assert gemini_service.gerar_carta_apresentacao({"cargo": "X"}, "perfil") == ""
+
+
+def test_carta_aceita_requisitos_em_formato_inesperado(monkeypatch):
+    import gemini_service
+    prompts = []
+    monkeypatch.setattr(gemini_service, "_chamar_gemini", lambda p: prompts.append(p) or "Olá")
+    gemini_service.gerar_carta_apresentacao(
+        {"cargo": "Dev", "requisitos": [{"nome": "SQL"}, 3, None], "tecnologias": "python"}, "perfil")
+    assert "Requisitos: SQL, 3" in prompts[0] and "Tecnologias: python" in prompts[0]

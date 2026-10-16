@@ -91,16 +91,22 @@ def _criar_sb() -> Client | None:
 
 def _janela_iso(dias: int) -> str:
     """Retorna timestamp ISO do início da janela de busca."""
-    dt = datetime.datetime.now() - datetime.timedelta(days=dias)
+    # Com fuso explícito: um horário "ingênuo" seria lido como UTC pelo
+    # Postgres do Supabase, deslocando a janela em 3h.
+    dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=dias)
     return dt.isoformat()
 
 
 _COLUNAS_VAGAS_LEGADO = "cargo, fonte, tecnologias, links_candidatura, status_aplicacao, created_at"
-_COLUNAS_VAGAS_V3     = _COLUNAS_VAGAS_LEGADO + ", empresa, score_match, modelo_trabalho"
+_COLUNAS_VAGAS_V3     = _COLUNAS_VAGAS_LEGADO + ", empresa, local, score_match, modelo_trabalho"
 
 
-def coletar_vagas(sb: Client, dias: int) -> list[dict]:
-    """Vagas da janela, ordenadas por score desc (quando o schema v3 existe)."""
+def coletar_vagas(sb: Client, dias: int, limite: int = 100) -> list[dict]:
+    """
+    Vagas da janela, ordenadas por score desc. Tenta as colunas do schema v3
+    e cai para as antigas se o banco ainda não tiver a migração.
+    Usada também pelo gerar_dashboard.py.
+    """
     if not sb:
         return []
     for colunas in (_COLUNAS_VAGAS_V3, _COLUNAS_VAGAS_LEGADO):
@@ -110,7 +116,7 @@ def coletar_vagas(sb: Client, dias: int) -> list[dict]:
                 .select(colunas)
                 .gte("created_at", _janela_iso(dias))
                 .order("created_at", desc=True)
-                .limit(100)
+                .limit(limite)
                 .execute()
             )
             vagas = res.data or []

@@ -27,7 +27,6 @@ Todas as funções:
   - Funcionam com google.genai (novo) e google.generativeai (fallback)
 """
 
-import os
 import re
 import json
 import logging
@@ -520,6 +519,14 @@ Corpo: {corpo[:800]}
 # 5. CARTA DE APRESENTAÇÃO (rascunho de candidatura)
 # ---------------------------------------------------------------------------
 
+def _juntar(itens) -> str:
+    """A IA às vezes devolve requisitos como dicts/números — tudo vira texto."""
+    if not isinstance(itens, list):
+        return str(itens or "")
+    return ", ".join(str(i.get("nome") or i.get("descricao") or i) if isinstance(i, dict) else str(i)
+                     for i in itens if i)
+
+
 def gerar_carta_apresentacao(vaga: dict, perfil: str) -> str:
     """
     Escreve uma carta curta e específica para a vaga, usando SÓ fatos do
@@ -532,8 +539,8 @@ def gerar_carta_apresentacao(vaga: dict, perfil: str) -> str:
             ("Empresa", vaga.get("empresa")),
             ("Local", vaga.get("local")),
             ("Modelo", vaga.get("modelo_trabalho")),
-            ("Requisitos", ", ".join(vaga.get("requisitos") or [])),
-            ("Tecnologias", ", ".join(vaga.get("tecnologias") or [])),
+            ("Requisitos", _juntar(vaga.get("requisitos"))),
+            ("Tecnologias", _juntar(vaga.get("tecnologias"))),
         ] if valor
     )
     prompt = f"""

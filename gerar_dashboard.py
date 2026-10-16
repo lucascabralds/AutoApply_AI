@@ -25,7 +25,7 @@ import webbrowser
 
 from dotenv import load_dotenv
 
-from briefing_diario import _formatar_reais
+from briefing_diario import _formatar_reais, coletar_vagas
 
 load_dotenv()
 
@@ -33,9 +33,6 @@ _BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_PATH = os.path.join(_BASE_DIR, "dashboard", "template.html")
 SAIDA_PADRAO  = os.getenv("DASHBOARD_SAIDA") or os.path.join(_BASE_DIR, "dashboard", "index.html")
 MARCADOR      = "/*__DADOS__*/{}"
-
-_COLUNAS_VAGAS_LEGADO = "cargo, fonte, tecnologias, links_candidatura, status_aplicacao, created_at"
-_COLUNAS_VAGAS_V3     = _COLUNAS_VAGAS_LEGADO + ", empresa, local, modelo_trabalho, score_match"
 
 
 # ── Coleta ───────────────────────────────────────────────────────────────────
@@ -56,14 +53,7 @@ def coletar(sb, dias: int) -> dict:
     desde = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=dias)).isoformat()
     dados = {}
 
-    try:
-        dados["vagas"] = _buscar(sb, "vagas_extraidas", _COLUNAS_VAGAS_V3, desde, 1000)
-    except Exception:
-        try:
-            dados["vagas"] = _buscar(sb, "vagas_extraidas", _COLUNAS_VAGAS_LEGADO, desde, 1000)
-        except Exception as e:
-            print(f"[WARN] vagas_extraidas: {e}")
-            dados["vagas"] = []
+    dados["vagas"] = coletar_vagas(sb, dias, limite=1000)
 
     consultas = {
         "despesas":     ("despesas_domesticas", "estabelecimento, categoria, valor, data_despesa, created_at"),

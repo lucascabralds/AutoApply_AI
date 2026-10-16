@@ -67,3 +67,20 @@ def test_iterar_partes_desce_em_multipart_aninhado():
 def test_query_exclui_todos_os_modulos():
     for nome in ("AutoApply/Vagas", "AutoApply/Certificados", "AutoApply/Alertas", "AutoApply/Geral"):
         assert f"-label:{nome}" in main._QUERY_JA_PROCESSADO
+
+
+def test_anexos_certificado_prioriza_pdf_e_ignora_logo_inline():
+    payload = {"parts": [
+        {"mimeType": "multipart/related", "parts": [
+            {"mimeType": "multipart/alternative", "parts": [{"mimeType": "text/html"}]},
+            {"mimeType": "image/png", "filename": "image001.png",
+             "headers": [{"name": "Content-ID", "value": "<logo>"},
+                         {"name": "Content-Disposition", "value": "inline; filename=image001.png"}]},
+        ]},
+        {"mimeType": "image/jpeg", "filename": "badge.jpg",
+         "headers": [{"name": "Content-Disposition", "value": "attachment; filename=badge.jpg"}]},
+        {"mimeType": "application/pdf", "filename": "certificado.pdf",
+         "headers": [{"name": "Content-Disposition", "value": "attachment; filename=certificado.pdf"}]},
+    ]}
+    nomes = [p["filename"] for p in main._anexos_certificado(list(main._iterar_partes(payload)))]
+    assert nomes == ["certificado.pdf", "badge.jpg"]

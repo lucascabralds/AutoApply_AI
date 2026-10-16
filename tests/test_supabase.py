@@ -90,3 +90,22 @@ def test_sem_migracao_cai_para_formato_antigo():
 ])
 def test_parsear_valor(entrada, esperado):
     assert main._parsear_valor(entrada) == esperado
+
+
+@pytest.mark.parametrize("entrada, esperado", [
+    ("3x de R$ 49,90", 49.90),
+    ("2 parcelas de R$ 1.000,00", 1000.0),
+    ("Total US$ 12.50", 12.50),
+])
+def test_parsear_valor_prefere_o_numero_da_moeda(entrada, esperado):
+    assert main._parsear_valor(entrada) == esperado
+
+
+@pytest.mark.parametrize("mensagem, eh_schema", [
+    ("PGRST204: Could not find the 'empresa' column of 'vagas_extraidas' in the schema cache", True),
+    ("42P10: there is no unique or exclusion constraint matching the ON CONFLICT specification", True),
+    ('23502: null value in column "cargo" violates not-null constraint', False),
+    ("22001: value too long for type character varying(50) in column x", False),
+])
+def test_erro_de_schema_so_para_migracao_ausente(mensagem, eh_schema):
+    assert main._erro_de_schema(Exception(mensagem)) is eh_schema

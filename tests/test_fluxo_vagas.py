@@ -178,3 +178,28 @@ def test_classificacao_indeterminada_nao_e_etiquetada_como_geral(monkeypatch, tm
     # e-mail direto de recrutador, sem palavra-chave nenhuma
     cat = main.classificar_email_pipeline("Conversa sobre oportunidade", "maria@startup.io", "Oi Lucas, tudo bem?", "x9")
     assert cat == "indeterminado" and "x9" in main._PENDENTES_IA
+
+
+def test_acoes_de_vaga_prioritaria_rodam_uma_vez_e_isolam_erros(ambiente, monkeypatch):
+    enviados, tarefas = [], []
+    monkeypatch.setattr(main, "telegram_configurado", lambda: True)
+    monkeypatch.setattr(main, "notificar_vaga", lambda v: enviados.append(v["cargo"]) or True)
+
+    def tarefa_que_quebra(servico, vaga):
+        tarefas.append(1)
+        raise TypeError("dict no lugar de str")
+
+    monkeypatch.setattr(main, "criar_tarefa_vaga", tarefa_que_quebra)
+    vaga = {"email_id": "m1", "cargo": "Dev", "empresa": "ACME", "score_gemini": 90, "tipo_email": "nova_vaga"}
+    main.acoes_vaga_prioritaria(None, object(), vaga, "")   # não levanta
+    main.acoes_vaga_prioritaria(None, object(), vaga, "")
+    assert enviados == ["Dev"]          # push só uma vez
+    assert tarefas == [1, 1]            # falhou → tenta de novo na próxima, sem derrubar nada
+
+
+def test_acoes_ignoram_vaga_de_acompanhamento(ambiente, monkeypatch):
+    enviados = []
+    monkeypatch.setattr(main, "telegram_configurado", lambda: True)
+    monkeypatch.setattr(main, "notificar_vaga", lambda v: enviados.append(1) or True)
+    main.acoes_vaga_prioritaria(None, None, {"cargo": "X", "score_gemini": 99, "tipo_email": "retorno"}, "")
+    assert enviados == []

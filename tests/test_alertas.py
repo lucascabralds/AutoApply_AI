@@ -70,3 +70,10 @@ def test_tarefa_de_follow_up_da_vaga():
     assert corpo["title"] == "Candidatar: Dev Python @ ACME"
     assert "https://x.com/v" in corpo["notes"]
     assert corpo["due"].endswith("T00:00:00.000Z")
+
+
+def test_escapar_html_aceita_numero():
+    from notificador import escapar_html
+    assert escapar_html(482913) == "482913"
+    assert escapar_html(None) == ""
+    assert escapar_html("<b>") == "&lt;b&gt;"

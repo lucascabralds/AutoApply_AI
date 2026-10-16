@@ -35,9 +35,10 @@ def telegram_configurado() -> bool:
     return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
 
-def escapar_html(texto: str) -> str:
-    """Escapa o mínimo exigido pelo parse_mode=HTML do Telegram."""
-    return (texto or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+def escapar_html(texto) -> str:
+    """Escapa o mínimo exigido pelo parse_mode=HTML do Telegram (aceita número/None)."""
+    texto = "" if texto is None else str(texto)
+    return texto.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def enviar_telegram(texto_html: str, timeout: int = 10) -> bool:
