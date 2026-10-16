@@ -90,6 +90,7 @@ def ambiente(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "_CACHE_PATH", str(tmp_path / "c.json"))
     monkeypatch.setattr(main, "_BUDGET_PATH", str(tmp_path / "b.json"))
     monkeypatch.setattr(main, "gateway_disponivel", lambda: True)
+    monkeypatch.setattr(main, "_ia_respondeu", lambda: True)
     monkeypatch.setattr(main, "_GEMINI_BUDGET", {"data": main.datetime.date.today().isoformat(),
                                                  "vagas": 0, "geral": 0, "alertas": 0, "cartas": 0})
     cartas = []

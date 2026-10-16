@@ -56,3 +56,4 @@ gemini_budget.json
 .pytest_cache/
 /dados/
 /dashboard/index.html
+rota_ia_pausa.json

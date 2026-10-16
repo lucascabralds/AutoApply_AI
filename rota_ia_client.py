@@ -19,6 +19,7 @@ Configuração (.env):
                       ou force um provedor específico com o id/name dele
 """
 
+import json
 import os
 import re
 import time
@@ -43,41 +44,63 @@ CHAT_COMPLETIONS_ENDPOINT = f"{ROTA_IA_URL}/chat/completions"
 # ---------------------------------------------------------------------------
 # Circuit breaker: se o gateway não responde (Rota.IA desligado, porta
 # errada...), cada e-mail esperava todas as tentativas e ainda gastava o
-# budget diário. Depois de FALHAS_PARA_PAUSAR chamadas seguidas sem
-# conseguir conectar, as próximas falham na hora durante ROTA_IA_PAUSA_SEG
-# segundos — e o pipeline usa a heurística local nesse intervalo.
+# budget diário. Quando uma chamada esgota as tentativas sem conseguir
+# conectar, as próximas falham na hora durante ROTA_IA_PAUSA_SEG segundos —
+# e o pipeline usa a heurística local nesse intervalo.
+#
+# A pausa fica gravada em disco: o agendador abre um processo novo a cada
+# minuto, e uma pausa só em memória seria esquecida a cada execução.
 # ---------------------------------------------------------------------------
-FALHAS_PARA_PAUSAR = 2
-PAUSA_SEG          = int(os.getenv("ROTA_IA_PAUSA_SEG", "300"))
+PAUSA_SEG    = int(os.getenv("ROTA_IA_PAUSA_SEG", "300"))
+_DADOS_DIR   = os.getenv("AUTOAPPLY_DADOS_DIR") or os.path.dirname(os.path.abspath(__file__))
+_PAUSA_PATH  = os.path.join(_DADOS_DIR, "rota_ia_pausa.json")
 
-_falhas_seguidas = 0
-_pausado_ate     = 0.0
+# True se a última chamar_ia() recebeu resposta do gateway — o pipeline usa
+# isso para não cobrar budget nem cachear resultado de chamadas que falharam.
+ultima_chamada_ok = False
 
 
 class GatewayIndisponivel(RuntimeError):
     """O Rota.IA não respondeu nas últimas chamadas; nova tentativa só após a pausa."""
 
 
+def _pausado_ate() -> float:
+    try:
+        with open(_PAUSA_PATH, encoding="utf-8") as f:
+            return float(json.load(f).get("pausado_ate", 0))
+    except (OSError, ValueError, AttributeError):
+        return 0.0
+
+
+def _gravar_pausa(ate: float) -> None:
+    try:
+        if ate:
+            with open(_PAUSA_PATH, "w", encoding="utf-8") as f:
+                json.dump({"pausado_ate": ate}, f)
+        elif os.path.exists(_PAUSA_PATH):
+            os.remove(_PAUSA_PATH)
+    except OSError:
+        pass
+
+
 def gateway_disponivel() -> bool:
     """False enquanto o circuit breaker estiver aberto (gateway fora do ar)."""
-    return time.monotonic() >= _pausado_ate
+    return time.time() >= _pausado_ate()
 
 
 def _registrar_falha_de_conexao() -> None:
-    global _falhas_seguidas, _pausado_ate
-    _falhas_seguidas += 1
-    if _falhas_seguidas >= FALHAS_PARA_PAUSAR:
-        _pausado_ate = time.monotonic() + PAUSA_SEG
-        logger.warning(
-            f"Rota.IA não responde em {ROTA_IA_URL} — pausando chamadas de IA por "
-            f"{PAUSA_SEG}s (o pipeline segue com heurísticas locais)."
-        )
+    _gravar_pausa(time.time() + PAUSA_SEG)
+    logger.warning(
+        f"Rota.IA não responde em {ROTA_IA_URL} — pausando chamadas de IA por "
+        f"{PAUSA_SEG}s (o pipeline segue com heurísticas locais)."
+    )
 
 
 def _registrar_sucesso() -> None:
-    global _falhas_seguidas, _pausado_ate
-    _falhas_seguidas = 0
-    _pausado_ate = 0.0
+    global ultima_chamada_ok
+    ultima_chamada_ok = True
+    if _pausado_ate():
+        _gravar_pausa(0)
 
 
 def _extrair_retry_delay(texto: str) -> float:
@@ -101,6 +124,9 @@ def chamar_ia(prompt: str, max_tentativas: int = 3, temperature: float = 0.1,
     Faz retry automático em 429 (rate limit) e 503 (provedor indisponível).
     Levanta a última exceção se todas as tentativas falharem.
     """
+    global ultima_chamada_ok
+    ultima_chamada_ok = False
+
     if not gateway_disponivel():
         raise GatewayIndisponivel(f"Rota.IA indisponível em {ROTA_IA_URL} (pausa ativa)")
 

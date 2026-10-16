@@ -83,6 +83,7 @@ def ambiente(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "_SCHEMA_VAGAS_V3", None)
     monkeypatch.setattr(main.time, "sleep", lambda s: None)
     monkeypatch.setattr(main, "telegram_configurado", lambda: False)
+    monkeypatch.setattr(main, "_ia_respondeu", lambda: True)
 
     chamadas_ia = []
 
@@ -145,3 +146,35 @@ def test_gateway_fora_nao_gasta_budget_nem_perde_o_email(ambiente, monkeypatch):
     # e o módulo de gerais não "rouba" o e-mail de vaga
     main.rodar_emails_gerais(gmail, {"geral_pai": "G"}, sb, "newer_than:1d", dry_run=False)
     assert "m1" not in gmail.labels_aplicadas
+
+
+def test_email_sem_vaga_real_e_marcado_e_nao_volta_para_a_ia(ambiente, monkeypatch):
+    monkeypatch.setattr(main, "_gs_extrair_vagas", lambda *a, **k: ambiente.append(1) or [])
+    gmail, sb = _FakeGmail(), _FakeSupabase()
+    main.rodar_vagas(gmail, {"vagas_pai": "L_PAI"}, sb, "newer_than:1d", dry_run=False)
+    main.rodar_vagas(gmail, {"vagas_pai": "L_PAI"}, sb, "newer_than:1d", dry_run=False)
+    assert ambiente == [1]                         # 2ª execução veio do cache
+    assert gmail.labels_aplicadas["m1"][0] == "L_PAI"
+    assert sb.gravados == []
+
+
+def test_falha_da_ia_nao_gasta_budget_nem_cacheia(ambiente, monkeypatch):
+    monkeypatch.setattr(main, "_ia_respondeu", lambda: False)
+    monkeypatch.setattr(main, "_GEMINI_BUDGET", {"data": main.datetime.date.today().isoformat(),
+                                                 "vagas": 0, "geral": 0, "alertas": 0, "cartas": 0})
+    gmail = _FakeGmail()
+    main.rodar_vagas(gmail, {}, _FakeSupabase(), "newer_than:1d", dry_run=False)
+    assert main._GEMINI_BUDGET["vagas"] == 0
+    assert main._cache_get("vagas", "m1", list) is None
+    assert gmail.labels_aplicadas == {}
+
+
+def test_classificacao_indeterminada_nao_e_etiquetada_como_geral(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "_GEMINI_CACHE", {})
+    monkeypatch.setattr(main, "_PENDENTES_IA", set())
+    monkeypatch.setattr(main, "gateway_disponivel", lambda: False)
+    monkeypatch.setattr(main, "_GEMINI_BUDGET", {"data": main.datetime.date.today().isoformat(),
+                                                 "vagas": 0, "geral": 0, "alertas": 0, "cartas": 0})
+    # e-mail direto de recrutador, sem palavra-chave nenhuma
+    cat = main.classificar_email_pipeline("Conversa sobre oportunidade", "maria@startup.io", "Oi Lucas, tudo bem?", "x9")
+    assert cat == "indeterminado" and "x9" in main._PENDENTES_IA
