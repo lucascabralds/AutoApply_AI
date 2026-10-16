@@ -130,3 +130,18 @@ def test_segunda_execucao_usa_cache_e_nao_gasta_ia(ambiente):
     main.rodar_vagas(gmail, {}, sb, "newer_than:1d", dry_run=False)
     main.rodar_vagas(gmail, {}, sb, "newer_than:1d", dry_run=False)
     assert len(ambiente) == 1
+
+
+def test_gateway_fora_nao_gasta_budget_nem_perde_o_email(ambiente, monkeypatch):
+    monkeypatch.setattr(main, "gateway_disponivel", lambda: False)
+    monkeypatch.setattr(main, "_GEMINI_BUDGET", {"data": main.datetime.date.today().isoformat(),
+                                                 "vagas": 0, "geral": 0, "alertas": 0})
+    gmail, sb = _FakeGmail(), _FakeSupabase()
+    main.rodar_vagas(gmail, {}, sb, "newer_than:1d", dry_run=False)
+    assert ambiente == []                      # IA não foi chamada
+    assert main._GEMINI_BUDGET["vagas"] == 0   # budget intacto
+    assert gmail.labels_aplicadas == {}        # sem label → tenta de novo depois
+
+    # e o módulo de gerais não "rouba" o e-mail de vaga
+    main.rodar_emails_gerais(gmail, {"geral_pai": "G"}, sb, "newer_than:1d", dry_run=False)
+    assert "m1" not in gmail.labels_aplicadas

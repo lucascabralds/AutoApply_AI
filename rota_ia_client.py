@@ -40,6 +40,45 @@ ROTA_IA_MODEL   = os.getenv("ROTA_IA_MODEL", "auto")
 
 CHAT_COMPLETIONS_ENDPOINT = f"{ROTA_IA_URL}/chat/completions"
 
+# ---------------------------------------------------------------------------
+# Circuit breaker: se o gateway não responde (Rota.IA desligado, porta
+# errada...), cada e-mail esperava todas as tentativas e ainda gastava o
+# budget diário. Depois de FALHAS_PARA_PAUSAR chamadas seguidas sem
+# conseguir conectar, as próximas falham na hora durante ROTA_IA_PAUSA_SEG
+# segundos — e o pipeline usa a heurística local nesse intervalo.
+# ---------------------------------------------------------------------------
+FALHAS_PARA_PAUSAR = 2
+PAUSA_SEG          = int(os.getenv("ROTA_IA_PAUSA_SEG", "300"))
+
+_falhas_seguidas = 0
+_pausado_ate     = 0.0
+
+
+class GatewayIndisponivel(RuntimeError):
+    """O Rota.IA não respondeu nas últimas chamadas; nova tentativa só após a pausa."""
+
+
+def gateway_disponivel() -> bool:
+    """False enquanto o circuit breaker estiver aberto (gateway fora do ar)."""
+    return time.monotonic() >= _pausado_ate
+
+
+def _registrar_falha_de_conexao() -> None:
+    global _falhas_seguidas, _pausado_ate
+    _falhas_seguidas += 1
+    if _falhas_seguidas >= FALHAS_PARA_PAUSAR:
+        _pausado_ate = time.monotonic() + PAUSA_SEG
+        logger.warning(
+            f"Rota.IA não responde em {ROTA_IA_URL} — pausando chamadas de IA por "
+            f"{PAUSA_SEG}s (o pipeline segue com heurísticas locais)."
+        )
+
+
+def _registrar_sucesso() -> None:
+    global _falhas_seguidas, _pausado_ate
+    _falhas_seguidas = 0
+    _pausado_ate = 0.0
+
 
 def _extrair_retry_delay(texto: str) -> float:
     """Lê o tempo de espera sugerido em erros 429/503, quando disponível."""
@@ -62,6 +101,9 @@ def chamar_ia(prompt: str, max_tentativas: int = 3, temperature: float = 0.1,
     Faz retry automático em 429 (rate limit) e 503 (provedor indisponível).
     Levanta a última exceção se todas as tentativas falharem.
     """
+    if not gateway_disponivel():
+        raise GatewayIndisponivel(f"Rota.IA indisponível em {ROTA_IA_URL} (pausa ativa)")
+
     if not ROTA_IA_API_KEY:
         raise ValueError(
             "ROTA_IA_API_KEY não encontrada no .env — inicie o gateway Rota.IA "
@@ -102,7 +144,18 @@ def chamar_ia(prompt: str, max_tentativas: int = 3, temperature: float = 0.1,
 
             resp.raise_for_status()
             data = resp.json()
+            _registrar_sucesso()
             return data["choices"][0]["message"]["content"]
+
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            ultima_exc = exc
+            if tentativa == max_tentativas:
+                _registrar_falha_de_conexao()
+                break
+            logger.warning(
+                f"Rota.IA — sem conexão (tentativa {tentativa}/{max_tentativas}): {exc}"
+            )
+            time.sleep(2)
 
         except requests.RequestException as exc:
             ultima_exc = exc

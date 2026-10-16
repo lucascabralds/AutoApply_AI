@@ -1189,6 +1189,7 @@ def _nome_seguro(texto: str, ext: str = "") -> str:
 #   cache local (por gmail_message_id) → heurística grátis → budget diário.
 # As funções de gemini_service nunca levantam exceção: devolvem {} / [].
 
+from rota_ia_client import gateway_disponivel
 from gemini_service import (
     classificar_email       as _gs_classificar,
     extrair_vagas           as _gs_extrair_vagas,
@@ -1256,7 +1257,7 @@ def classificar_email_pipeline(assunto: str, remetente: str, corpo_preview: str,
     if any(w in txt for w in _PALAVRAS_FINANCEIRO):
         return "financeiro"
 
-    if _tem_budget("geral"):
+    if _tem_budget("geral") and gateway_disponivel():
         resultado = _gs_classificar(assunto, remetente, corpo_preview)
         _consumir_budget("geral")
         # "outro" também é o retorno quando o gateway falha — não fica no
@@ -1313,6 +1314,12 @@ def extrair_vagas_pipeline(assunto: str, remetente: str, corpo: str,
         Log.warn(f"  ⚠ Budget IA/vagas esgotado ({_GEMINI_BUDGET.get('vagas',0)}/{_BUDGET_LIMITE['vagas']}) — usando heurística")
         return [_vaga_heuristica(assunto, remetente, corpo, ancoras)]
 
+    if not gateway_disponivel():
+        # Sem IA agora: devolve vazio para o e-mail ficar sem label e ser
+        # reprocessado com IA na próxima execução (não gasta budget).
+        Log.warn("  ⚠ Rota.IA indisponível — e-mail fica para a próxima execução")
+        return []
+
     resultado = _gs_extrair_vagas(assunto, remetente, corpo, links_html=ancoras)
     _consumir_budget("vagas")
     _cache_set("vagas", msg_id, resultado)
@@ -1330,6 +1337,8 @@ def analisar_acesso_pipeline(remetente: str, assunto: str, corpo: str,
     if not _tem_budget("alertas"):
         Log.warn("  ⚠ Budget IA/alertas esgotado — alerta ignorado")
         return {}
+    if not gateway_disponivel():
+        return {}
 
     resultado = _gs_analisar_acesso(remetente, assunto, corpo)
     _consumir_budget("alertas")
@@ -1344,7 +1353,7 @@ def classificar_geral_pipeline(remetente: str, assunto: str, corpo: str,
     if cached is not None:
         return cached
 
-    if not _tem_budget("geral"):
+    if not _tem_budget("geral") or not gateway_disponivel():
         return {}
 
     resultado = _gs_classificar_geral(remetente, assunto, corpo)
@@ -2027,6 +2036,12 @@ def rodar_emails_gerais(service, labels: dict, sb: Client | None, query: str, dr
         # ── [FIX] Ignora 100% e-mails do próprio AutoApply AI (grátis, antes da IA) ──
         if _eh_email_proprio(assunto, remetente):
             Log.info(f"  ⏭ Ignorado (e-mail do próprio AutoApply AI): {assunto[:50]}")
+            continue
+
+        # E-mail de vaga que o módulo de vagas não conseguiu extrair agora
+        # (IA fora do ar, budget...) fica sem label para ser tentado de novo
+        # — se este módulo o etiquetasse como Geral, a vaga se perderia.
+        if _detectar_fonte(remetente) != "outro" or _cache_get("classif", msg["id"], str) == "vaga":
             continue
 
         corpo     = extrair_corpo(detalhe["payload"])
