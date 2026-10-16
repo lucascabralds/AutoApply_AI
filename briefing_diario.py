@@ -23,6 +23,7 @@ import sys
 import json
 import argparse
 import datetime
+from html import escape
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -93,23 +94,30 @@ def _janela_iso(dias: int) -> str:
     return dt.isoformat()
 
 
+_COLUNAS_VAGAS_LEGADO = "cargo, fonte, tecnologias, links_candidatura, status_aplicacao, created_at"
+_COLUNAS_VAGAS_V3     = _COLUNAS_VAGAS_LEGADO + ", empresa, score_match, modelo_trabalho"
+
+
 def coletar_vagas(sb: Client, dias: int) -> list[dict]:
-    """Vagas novas com score > 0, ordenadas por score desc."""
+    """Vagas da janela, ordenadas por score desc (quando o schema v3 existe)."""
     if not sb:
         return []
-    try:
-        res = (
-            sb.table("vagas_extraidas")
-            .select("cargo, fonte, tecnologias, links_candidatura, status_aplicacao, created_at")
-            .gte("created_at", _janela_iso(dias))
-            .order("created_at", desc=True)
-            .limit(50)
-            .execute()
-        )
-        return res.data or []
-    except Exception as e:
-        print(f"[WARN] coletar_vagas: {e}")
-        return []
+    for colunas in (_COLUNAS_VAGAS_V3, _COLUNAS_VAGAS_LEGADO):
+        try:
+            res = (
+                sb.table("vagas_extraidas")
+                .select(colunas)
+                .gte("created_at", _janela_iso(dias))
+                .order("created_at", desc=True)
+                .limit(100)
+                .execute()
+            )
+            vagas = res.data or []
+            return sorted(vagas, key=lambda v: v.get("score_match") or 0, reverse=True)
+        except Exception as e:
+            ultimo_erro = e
+    print(f"[WARN] coletar_vagas: {ultimo_erro}")
+    return []
 
 
 def coletar_despesas(sb: Client, dias: int) -> list[dict]:
@@ -232,14 +240,19 @@ def _formatar_vagas(vagas: list[dict]) -> tuple[str, str]:
     # Agrupa por fonte
     por_fonte: dict[str, list] = {}
     for v in vagas:
-        f = v.get("fonte", "outro")
+        f = v.get("fonte") or "outro"
         por_fonte.setdefault(f, []).append(v)
 
     for fonte, items in sorted(por_fonte.items()):
         txt_linhas.append(f"  [{fonte.upper()}] {len(items)} vaga(s)")
-        html_linhas.append(f"<b>{fonte.upper()}</b> — {len(items)} vaga(s)<br>")
-        for v in items[:5]:   # máx 5 por fonte no briefing
-            cargo = v.get("cargo", "Cargo não identificado")[:55]
+        html_linhas.append(f"<b>{escape(fonte.upper())}</b> — {len(items)} vaga(s)<br>")
+        for v in items[:5]:   # máx 5 por fonte no briefing (já vêm ordenadas por score)
+            cargo = (v.get("cargo") or "Cargo não identificado")[:55]
+            empresa = v.get("empresa")
+            if empresa and not empresa.lower().startswith("não identificada"):
+                cargo = f"{cargo} @ {empresa[:30]}"
+            score = v.get("score_match")
+            flag = "" if score is None else ("🔥 " if score >= 75 else "⚡ " if score >= 50 else "")
             links_raw = v.get("links_candidatura") or "[]"
             if isinstance(links_raw, str):
                 try:
@@ -251,14 +264,28 @@ def _formatar_vagas(vagas: list[dict]) -> tuple[str, str]:
             link = links[0] if links else None
             status = v.get("status_aplicacao", "nova")
 
-            txt_linhas.append(f"    · {cargo}  [{status}]")
+            score_txt = f" {score}%" if score else ""
+
+            txt_linhas.append(f"    · {flag}{cargo}{score_txt}  [{status}]")
             if link:
                 txt_linhas.append(f"      {link[:70]}")
 
-            html_cargo = f'<a href="{link}">{cargo}</a>' if link else cargo
-            html_linhas.append(f"&nbsp;&nbsp;• {html_cargo} <i>[{status}]</i><br>")
+            cargo_html = escape(cargo)
+            html_cargo = f'<a href="{escape(link, quote=True)}">{cargo_html}</a>' if link else cargo_html
+            html_linhas.append(f"&nbsp;&nbsp;• {flag}{html_cargo}{score_txt} <i>[{escape(str(status))}]</i><br>")
 
     return "\n".join(txt_linhas) + "\n", "".join(html_linhas)
+
+
+def _formatar_reais(valor) -> str:
+    """49.9 → 'R$ 49,90'. Texto livre (registros antigos) é devolvido como veio."""
+    if valor in (None, ""):
+        return "—"
+    try:
+        n = float(valor)
+    except (TypeError, ValueError):
+        return str(valor)
+    return "R$ " + f"{n:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
 def _formatar_despesas(despesas: list[dict]) -> tuple[str, str]:
@@ -267,12 +294,12 @@ def _formatar_despesas(despesas: list[dict]) -> tuple[str, str]:
     txt = []
     html = []
     for d in despesas:
-        est   = d.get("estabelecimento", "?")[:35]
-        val   = d.get("valor") or "—"
+        est   = (d.get("estabelecimento") or "?")[:35]
+        val   = _formatar_reais(d.get("valor"))
         dt    = d.get("data_despesa") or "—"
-        cat   = d.get("categoria", "")
+        cat   = d.get("categoria") or ""
         txt.append(f"  · {est:<35}  {val:<12}  venc. {dt}")
-        html.append(f"<li><b>{est}</b> — {val} — venc. <b>{dt}</b> <i>({cat})</i></li>")
+        html.append(f"<li><b>{escape(est)}</b> — {val} — venc. <b>{escape(str(dt))}</b> <i>({escape(cat)})</i></li>")
     return "\n".join(txt) + "\n", "".join(html)
 
 
@@ -284,7 +311,7 @@ def _formatar_lista_simples(items: list[dict], campos: list[str]) -> tuple[str, 
         partes = [str(it.get(c, "")) for c in campos if it.get(c)]
         linha  = "  · " + "  |  ".join(partes[:3])
         txt.append(linha[:100])
-        html.append("<li>" + "  |  ".join(partes[:3])[:100] + "</li>")
+        html.append("<li>" + escape("  |  ".join(partes[:3])[:100]) + "</li>")
     return "\n".join(txt) + "\n", "".join(html)
 
 
@@ -298,7 +325,7 @@ def _formatar_comunicados(msgs: list[dict]) -> tuple[str, str]:
         snippet = m.get("snippet", "")[:80]
         txt.append(f"  · [{rem}] {assunto}")
         txt.append(f"    {snippet}")
-        html.append(f"<li><b>{rem}</b> — {assunto}<br><i>{snippet}</i></li>")
+        html.append(f"<li><b>{escape(rem)}</b> — {escape(assunto)}<br><i>{escape(snippet)}</i></li>")
     return "\n".join(txt) + "\n", "".join(html)
 
 

@@ -818,25 +818,79 @@ def _sb_upsert_insert(sb: Client, tabela: str, registro: dict, conflict_col: str
         return False
 
 
+def _vaga_uid(email_id: str, cargo: str | None, empresa: str | None) -> str:
+    """
+    Identificador estável de UMA vaga: mesmo e-mail + mesmo cargo + mesma
+    empresa → mesmo uid. Permite upsert por vaga (um digest com 10 vagas
+    vira 10 linhas) sem duplicar quando o e-mail é processado de novo.
+    """
+    chave = "|".join([email_id or "", _normalizar_para_match(cargo or ""), _normalizar_para_match(empresa or "")])
+    return hashlib.sha1(chave.encode("utf-8")).hexdigest()[:20]
+
+
+# None = ainda não testado nesta execução; False = banco sem a migração v3
+_SCHEMA_VAGAS_V3: bool | None = None
+
+
+def _erro_de_schema(exc: Exception) -> bool:
+    """Coluna inexistente (PGRST204) ou falta do índice único de vaga_uid (42P10)."""
+    msg = str(exc).lower()
+    return any(p in msg for p in ("schema cache", "pgrst204", "42p10", "column", "on conflict"))
+
+
 def salvar_vaga(sb: Client | None, vaga: dict, dry_run: bool = False) -> bool:
+    global _SCHEMA_VAGAS_V3
     if dry_run:
         Log.info(f"  [DRY-RUN] vagas_extraidas: {vaga.get('cargo')} @ {vaga.get('empresa')}")
         return True
     if not sb:
         return False
-    # Mapeia para o schema real do Supabase (imagem do schema)
-    registro = {
+
+    links = [vaga["link_candidatura"]] if vaga.get("link_candidatura") else []
+
+    if _SCHEMA_VAGAS_V3 is not False:
+        registro = {
+            "vaga_uid":          _vaga_uid(vaga.get("email_id"), vaga.get("cargo"), vaga.get("empresa")),
+            "gmail_message_id":  vaga.get("email_id"),
+            "cargo":             vaga.get("cargo"),
+            "empresa":           vaga.get("empresa"),
+            "local":             vaga.get("local"),
+            "modelo_trabalho":   vaga.get("modelo_trabalho"),
+            "salario":           vaga.get("salario"),
+            "score_match":       int(vaga.get("score_gemini") or 0),
+            "fonte":             vaga.get("fonte"),
+            "tecnologias":       vaga.get("tecnologias") or [],
+            "requisitos":        vaga.get("requisitos") or [],
+            "links_candidatura": links,
+            "tipo_email":        vaga.get("tipo_email"),
+            "data_email":        vaga.get("data_email"),
+            "status_aplicacao":  vaga.get("status", "nova"),
+        }
+        try:
+            sb.table("vagas_extraidas").upsert(registro, on_conflict="vaga_uid").execute()
+            _SCHEMA_VAGAS_V3 = True
+            return True
+        except Exception as e:
+            if _SCHEMA_VAGAS_V3 is None and _erro_de_schema(e):
+                _SCHEMA_VAGAS_V3 = False
+                Log.warn(
+                    "  Tabela vagas_extraidas sem as colunas novas — rode supabase/schema.sql "
+                    "no SQL Editor do Supabase. Usando o formato antigo (1 linha por e-mail)."
+                )
+            else:
+                Log.warn(f"  Supabase 'vagas_extraidas' falhou: {e}")
+                return False
+
+    # Formato antigo (antes da migração v3)
+    registro_legado = {
         "gmail_message_id":  vaga.get("email_id"),
         "cargo":             vaga.get("cargo"),
         "fonte":             vaga.get("fonte"),
-        "tecnologias":       vaga.get("tecnologias"),        # jsonb (já é string JSON)
-        "links_candidatura": json.dumps(                     # jsonb — array de links
-            [vaga["link_candidatura"]] if vaga.get("link_candidatura") else [],
-            ensure_ascii=False,
-        ),
+        "tecnologias":       json.dumps(vaga.get("tecnologias") or [], ensure_ascii=False),
+        "links_candidatura": json.dumps(links, ensure_ascii=False),
         "status_aplicacao":  vaga.get("status", "nova"),
     }
-    return _sb_upsert_insert(sb, "vagas_extraidas", registro, "gmail_message_id")
+    return _sb_upsert_insert(sb, "vagas_extraidas", registro_legado, "gmail_message_id")
 
 
 def salvar_certificado(sb: Client | None, cert: dict, dry_run: bool = False) -> bool:
@@ -901,10 +955,10 @@ def salvar_email_geral(sb: Client | None, registro_raw: dict, dry_run: bool = Fa
             "categoria":        registro_raw.get("subcategoria", "boleto_fatura"),
             "origem_recurso":   "email",
         }
-        # Só adiciona valor se não for None/vazio
-        valor_raw = registro_raw.get("valor")
-        if valor_raw:
-            registro["valor"] = valor_raw
+        # Só adiciona valor se for um número reconhecível ("R$ 1.234,56" → 1234.56)
+        valor = _parsear_valor(registro_raw.get("valor"))
+        if valor is not None:
+            registro["valor"] = valor
 
         # Só adiciona data_despesa se não for None/vazio
         data_raw = registro_raw.get("data_evento") or registro_raw.get("data_despesa")
@@ -919,6 +973,36 @@ def salvar_email_geral(sb: Client | None, registro_raw: dict, dry_run: bool = Fa
     # ── Comunicado → sem tabela dedicada ainda, label suficiente ────────────
     # (agendamento, comunicado, servicos)
     return True
+
+
+def _parsear_valor(texto) -> float | None:
+    """
+    Converte valores como 'R$ 1.234,56', '49,90', 'USD 12.50' ou 49.9 em float.
+    Retorna None quando não há número reconhecível.
+    """
+    if texto is None or isinstance(texto, bool):
+        return None
+    if isinstance(texto, (int, float)):
+        return float(texto)
+    m = re.search(r"\d[\d.,]*", str(texto))
+    if not m:
+        return None
+    num = m.group(0).rstrip(".,")
+    if "," in num and "." in num:
+        # o separador que aparece por último é o decimal
+        if num.rfind(",") > num.rfind("."):
+            num = num.replace(".", "").replace(",", ".")
+        else:
+            num = num.replace(",", "")
+    elif "," in num:
+        inteiro, _, dec = num.rpartition(",")
+        num = f"{inteiro.replace(',', '')}.{dec}" if len(dec) <= 2 else num.replace(",", "")
+    elif num.count(".") > 1 or (num.count(".") == 1 and len(num.rpartition(".")[2]) == 3):
+        num = num.replace(".", "")   # 1.234 ou 1.234.567 → milhar
+    try:
+        return round(float(num), 2)
+    except ValueError:
+        return None
 
 
 def _parsear_data(texto: str) -> str | None:
@@ -1237,12 +1321,16 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
 
         score_max = 0
         ancoras_usadas: set = set()
+        techs_corpo = _extrair_tecnologias(corpo)
         for vaga_raw in vagas_extraidas:
-            # Enriquece com tecnologias detectadas heuristicamente
-            techs_h  = _extrair_tecnologias(corpo)
             techs_g  = [t.lower() for t in vaga_raw.get("tecnologias", [])
                         if isinstance(t, str)]
-            techs    = list(dict.fromkeys(techs_h + techs_g))
+            # Tecnologias achadas no corpo inteiro só valem para e-mails de
+            # 1 vaga — num digest elas misturariam as stacks de todas as vagas.
+            if len(vagas_extraidas) == 1:
+                techs = list(dict.fromkeys(techs_corpo + techs_g))
+            else:
+                techs = techs_g or techs_corpo
             score    = vaga_raw.get("score_match", 0) or 0
             score_max = max(score_max, score)
 
@@ -1267,9 +1355,8 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
                 "local":             vaga_raw.get("local"),
                 "modelo_trabalho":   vaga_raw.get("modelo_trabalho", "Não informado"),
                 "salario":           vaga_raw.get("salario"),
-                "requisitos":        json.dumps(vaga_raw.get("requisitos", []),
-                                               ensure_ascii=False),
-                "tecnologias":       json.dumps(techs, ensure_ascii=False),
+                "requisitos":        vaga_raw.get("requisitos", []),
+                "tecnologias":       techs,
                 "score_gemini":      score,
                 "tipo_email":        vaga_raw.get("tipo_email",         "nova_vaga"),
                 "status_candidatura":vaga_raw.get("status_candidatura", "nova"),
