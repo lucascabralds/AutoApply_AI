@@ -60,6 +60,8 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload
 
 import google_auth
+from notificador import enviar_telegram, escapar_html, telegram_configurado
+from seguranca import redigir_segredo
 
 # ---------------------------------------------------------------------------
 # Supabase
@@ -150,8 +152,17 @@ def _salvar_budget(budget: dict) -> None:
 _GEMINI_BUDGET: dict = _carregar_budget()
 
 
+def _virar_dia_do_budget() -> None:
+    """Zera os contadores quando o dia muda (importa no modo --intervalo)."""
+    hoje = datetime.date.today().isoformat()
+    if _GEMINI_BUDGET.get("data") != hoje:
+        _GEMINI_BUDGET.clear()
+        _GEMINI_BUDGET.update({"data": hoje, "vagas": 0, "geral": 0, "alertas": 0})
+
+
 def _tem_budget(modulo: str) -> bool:
     """Retorna True se ainda há chamadas disponíveis para este módulo hoje."""
+    _virar_dia_do_budget()
     return _GEMINI_BUDGET.get(modulo, 0) < _BUDGET_LIMITE.get(modulo, 10)
 
 def _consumir_budget(modulo: str) -> None:
@@ -174,6 +185,12 @@ def _status_budget() -> str:
 
 # Escopos, token.json e credentials.json ficam centralizados em google_auth.py
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Alertas: só notifica no Telegram códigos de e-mails com até N minutos
+# (um OTP de ontem já expirou e só faria barulho no celular).
+OTP_MAX_IDADE_MIN = int(os.getenv("OTP_MAX_IDADE_MIN", "15"))
+# Vagas: score mínimo para virar notificação no Telegram
+SCORE_NOTIFICAR_VAGA = int(os.getenv("SCORE_NOTIFICAR_VAGA", "75"))
 
 # Máximo de e-mails lidos por módulo em cada execução
 LIMITE_EMAILS = int(os.getenv("LIMITE_EMAILS_POR_MODULO", "100"))
@@ -910,17 +927,26 @@ def salvar_certificado(sb: Client | None, cert: dict, dry_run: bool = False) -> 
     return _sb_upsert_insert(sb, "certificados_portfolio", registro, "gmail_message_id")
 
 
+def _idade_minutos(detalhe: dict) -> float | None:
+    """Minutos desde que o Gmail recebeu a mensagem (campo internalDate, em ms)."""
+    try:
+        recebido = int(detalhe["internalDate"]) / 1000
+    except (KeyError, TypeError, ValueError):
+        return None
+    return (time.time() - recebido) / 60
+
+
 def salvar_alerta(sb: Client | None, alerta: dict, dry_run: bool = False) -> bool:
     if dry_run:
         Log.info(f"  [DRY-RUN] log_acessos_otp: {alerta.get('plataforma')}")
         return True
     if not sb:
         return False
-    # Schema: log_acessos_otp
+    # Schema: log_acessos_otp — o segredo em si nunca vai para o banco
     registro = {
         "plataforma":      alerta.get("plataforma"),
         "tipo_alerta":     alerta.get("tipo_solicitacao"),
-        "codigo_extraido": alerta.get("codigo_ou_link"),
+        "codigo_extraido": redigir_segredo(alerta.get("codigo_ou_link")),
     }
     try:
         sb.table("log_acessos_otp").insert(registro).execute()
@@ -1260,6 +1286,20 @@ def classificar_geral_pipeline(remetente: str, assunto: str, corpo: str,
 # 7. MÓDULO DE VAGAS
 # ===========================================================================
 
+def notificar_vaga(vaga: dict) -> None:
+    """Push no Telegram para vagas de alta prioridade (no-op se não configurado)."""
+    if not telegram_configurado():
+        return
+    linhas = [
+        f"🔥 <b>{escapar_html(vaga['cargo'])}</b> — {vaga.get('score_gemini', 0)}%",
+        escapar_html(f"{vaga['empresa']} · {vaga.get('modelo_trabalho') or 'Não informado'}"
+                     + (f" · {vaga['local']}" if vaga.get("local") else "")),
+    ]
+    if vaga.get("link_candidatura"):
+        linhas.append(f'<a href="{escapar_html(vaga["link_candidatura"])}">Ver vaga</a>')
+    enviar_telegram("\n".join(linhas))
+
+
 def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: bool):
     Log.section("Módulo 1 — Extração de Vagas")
 
@@ -1375,6 +1415,9 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
             tipo = vaga_raw.get("tipo_email", "nova_vaga")
             lk   = f" → {link[:50]}" if link else ""
             Log.ok(f"    {flag} [{tipo}] {vaga['cargo']} @ {vaga['empresa']} — score {score}%{lk}")
+
+            if score >= SCORE_NOTIFICAR_VAGA and tipo == "nova_vaga" and not dry_run:
+                notificar_vaga(vaga)
 
             time.sleep(0.5)  # throttle entre vagas do mesmo e-mail
 
@@ -1754,6 +1797,15 @@ def rodar_alertas(service, labels: dict, sb: Client | None, query_dias: int, dry
         _aplicar_label(service, msg["id"], labels.get("alerta_pai"), tipo_label)
         # ────────────────────────────────────────────────────────────────────
 
+        idade = _idade_minutos(detalhe)
+        if not dry_run and telegram_configurado() and idade is not None and idade <= OTP_MAX_IDADE_MIN:
+            linhas = [f"🔒 <b>{escapar_html(plataforma)}</b> — {escapar_html(tipo)}"]
+            if codigo:
+                linhas.append(f"<code>{escapar_html(codigo)}</code>")
+            linhas.append(f"<i>{escapar_html(assunto[:80])}</i>")
+            if enviar_telegram("\n".join(linhas)):
+                Log.ok("  📲 Enviado para o Telegram")
+
         alerta_record = {
             "email_id":         msg["id"],
             "plataforma":       plataforma,
@@ -1991,13 +2043,20 @@ def main():
         "--dry-run", action="store_true",
         help="Executa sem gravar nada no Supabase/Drive (modo teste)",
     )
+    parser.add_argument(
+        "--intervalo", type=int, default=0, metavar="SEGUNDOS",
+        help=(
+            "Fica rodando em loop, repetindo os módulos a cada N segundos.\n"
+            "Ex.: --modulo alertas --intervalo 60  → OTPs no Telegram em ~1 min"
+        ),
+    )
     args = parser.parse_args()
 
     inicio = datetime.datetime.now()
     query  = f"newer_than:{args.dias}d"
 
     print(f"\n{'='*58}")
-    print(f"  AUTOAPPLY AI — Pipeline Principal  v2")
+    print(f"  AUTOAPPLY AI — Pipeline Principal  v3")
     print(f"  {datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')}  |  janela: {args.dias} dia(s)")
     if args.dry_run:
         print(f"  ⚠  MODO DRY-RUN — nenhum dado será gravado")
@@ -2012,26 +2071,41 @@ def main():
     labels = garantir_labels(service)
     sb = None if args.dry_run else criar_supabase()
 
-    modulos_rodados = []
     rodar_todos = args.modulo == "todos"
 
-    if rodar_todos or args.modulo == "vagas":
-        rodar_vagas(service, labels, sb, query, args.dry_run)
-        modulos_rodados.append("vagas")
+    def executar_ciclo() -> list:
+        modulos_rodados = []
+        if rodar_todos or args.modulo == "vagas":
+            rodar_vagas(service, labels, sb, query, args.dry_run)
+            modulos_rodados.append("vagas")
 
-    if rodar_todos or args.modulo == "certificados":
-        rodar_certificados(service, drive_service, labels, sb, args.dias, args.dry_run)
-        modulos_rodados.append("certificados")
+        if rodar_todos or args.modulo == "certificados":
+            rodar_certificados(service, drive_service, labels, sb, args.dias, args.dry_run)
+            modulos_rodados.append("certificados")
 
-    if rodar_todos or args.modulo == "alertas":
-        rodar_alertas(service, labels, sb, args.dias, args.dry_run)
-        modulos_rodados.append("alertas")
+        if rodar_todos or args.modulo == "alertas":
+            rodar_alertas(service, labels, sb, args.dias, args.dry_run)
+            modulos_rodados.append("alertas")
 
-    if rodar_todos or args.modulo == "geral":
-        rodar_emails_gerais(service, labels, sb, query, args.dry_run)
-        modulos_rodados.append("geral")
+        if rodar_todos or args.modulo == "geral":
+            rodar_emails_gerais(service, labels, sb, query, args.dry_run)
+            modulos_rodados.append("geral")
+        return modulos_rodados
 
-    imprimir_sumario(inicio, modulos_rodados)
+    if args.intervalo <= 0:
+        imprimir_sumario(inicio, executar_ciclo())
+        return
+
+    Log.info(f"Modo contínuo: repetindo a cada {args.intervalo}s (Ctrl+C para parar)")
+    try:
+        while True:
+            try:
+                executar_ciclo()
+            except Exception as e:   # uma falha de rede não deve matar o loop
+                Log.error(f"Ciclo falhou: {e}")
+            time.sleep(args.intervalo)
+    except KeyboardInterrupt:
+        imprimir_sumario(inicio, [args.modulo])
 
 
 if __name__ == "__main__":

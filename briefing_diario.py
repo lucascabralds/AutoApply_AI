@@ -37,6 +37,7 @@ from googleapiclient.errors import HttpError
 import base64
 
 import google_auth
+from seguranca import redigir_segredo
 
 # ---------------------------------------------------------------------------
 # Supabase
@@ -402,6 +403,8 @@ def montar_briefing(
     # ── Seções ───────────────────────────────────────────────────────────────
     tv, hv = _formatar_vagas(vagas)
     td, hd = _formatar_despesas(despesas)
+    # Registros antigos podem ter o código/link em claro — nunca vão para o e-mail
+    alertas = [{**a, "codigo_extraido": redigir_segredo(a.get("codigo_extraido"))} for a in alertas]
     ta, ha = _formatar_lista_simples(alertas,      ["plataforma", "tipo_alerta", "codigo_extraido"])
     tc, hc = _formatar_lista_simples(certificados, ["plataforma", "nome_curso",  "status_extracao"])
     tag, hag = _formatar_comunicados(agendamentos)
