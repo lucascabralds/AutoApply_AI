@@ -102,3 +102,11 @@ def test_parsear_data():
 def test_subcategoria_financeiro():
     assert main._detectar_subcategoria_financeiro("Seu boleto vence amanhã") == "boleto_fatura"
     assert main._detectar_subcategoria_financeiro("Comprovante de Pix") == "pix"
+
+
+def test_normalizar_categoria_geral():
+    assert main._normalizar_categoria_geral("comunicado", "servicos") == "comunicado"
+    assert main._normalizar_categoria_geral("servico", "comunicado") == "servicos"
+    assert main._normalizar_categoria_geral("outro", "comunicado") == "comunicado"
+    assert main._normalizar_categoria_geral(None, "financeiro") == "financeiro"
+    assert main._normalizar_categoria_geral("inventada", "agendamento") == "agendamento"

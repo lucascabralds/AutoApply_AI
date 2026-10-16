@@ -1961,6 +1961,21 @@ def _detectar_subcategoria_financeiro(texto: str) -> str:
             return sub
     return "boleto_fatura"
 
+_CATEGORIAS_GERAIS = {"agendamento", "financeiro", "comunicado", "servicos"}
+
+
+def _normalizar_categoria_geral(categoria_ia: str | None, categoria_heuristica: str) -> str:
+    """
+    A IA às vezes responde no singular ("servico") ou com "outro". Antes a
+    resposta sobrescrevia a heurística sem validação — e como o prompt nem
+    tinha "comunicado", e-mails que a heurística marcava como comunicado
+    nunca recebiam a label Geral/Comunicado.
+    """
+    cat = (categoria_ia or "").strip().lower()
+    cat = {"servico": "servicos", "serviço": "servicos", "serviços": "servicos"}.get(cat, cat)
+    return cat if cat in _CATEGORIAS_GERAIS else categoria_heuristica
+
+
 def _categoria_heuristica(assunto: str, corpo: str) -> str:
     """Classificação rápida sem consumir token do Gemini."""
     txt = (assunto + " " + corpo[:300]).lower()
@@ -2030,11 +2045,12 @@ def rodar_emails_gerais(service, labels: dict, sb: Client | None, query: str, dr
         if _tem_budget("geral") and categoria in ("agendamento", "financeiro", "comunicado"):
             try:
                 analise = classificar_geral_pipeline(remetente, assunto, corpo, msg["id"])
-                if analise.get("categoria"):
-                    categoria = analise["categoria"]
-                # Sobrescreve subcategoria se Gemini identificou melhor
+                categoria = _normalizar_categoria_geral(analise.get("categoria"), categoria)
+                # Sobrescreve subcategoria se a IA identificou melhor
                 if analise.get("subcategoria"):
                     subcategoria = analise["subcategoria"]
+                elif categoria == "financeiro" and not subcategoria:
+                    subcategoria = _detectar_subcategoria_financeiro(assunto + " " + corpo[:200])
             except Exception as e:
                 Log.warn(f"  Gemini geral falhou: {e}")
 
@@ -2077,7 +2093,7 @@ def rodar_emails_gerais(service, labels: dict, sb: Client | None, query: str, dr
         # ────────────────────────────────────────────────────────────────────
 
         total += 1
-        icone = {"agendamento": "📅", "financeiro": "💰", "servicos": "🔔"}.get(categoria, "📧")
+        icone = {"agendamento": "📅", "financeiro": "💰", "comunicado": "📢", "servicos": "🔔"}.get(categoria, "📧")
         Log.ok(f"  {icone} [{categoria}] {remetente.split('<')[0].strip()[:30]} — {resumo[:50]}")
 
     Log.ok(f"E-mails gerais: {total} processados | {salvas} salvos no Supabase")
