@@ -55,3 +55,4 @@ gemini_budget.json
 /certificados/
 .pytest_cache/
 /dados/
+/dashboard/index.html

@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AutoApply AI — Dashboard</title>
+<!--
+  Template do dashboard. NÃO abra este arquivo direto: rode
+      python gerar_dashboard.py
+  que busca os dados no Supabase e gera dashboard/index.html.
+-->
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #0d0f14;
+  --surface: #141720;
+  --surface2: #1c2030;
+  --surface3: #232840;
+  --border: rgba(255,255,255,0.07);
+  --border2: rgba(255,255,255,0.13);
+  --text: #e8eaf0;
+  --muted: #7a82a0;
+  --faint: #3a4060;
+  --green: #00e5a0;
+  --green-dim: rgba(0,229,160,0.12);
+  --amber: #f0c040;
+  --amber-dim: rgba(240,192,64,0.12);
+  --red: #ff5c6a;
+  --red-dim: rgba(255,92,106,0.12);
+  --blue: #4d9fff;
+  --blue-dim: rgba(77,159,255,0.12);
+  --purple: #a78bfa;
+  --purple-dim: rgba(167,139,250,0.12);
+  --mono: 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+}
+body { background: var(--bg); color: var(--text); font-family: var(--mono); font-size: 13px; }
+.shell { display: flex; height: 100vh; min-height: 600px; overflow: hidden; }
+
+/* SIDEBAR */
+.sidebar { width: 200px; min-width: 200px; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; padding: 0; }
+.logo { padding: 18px 16px 14px; border-bottom: 1px solid var(--border); }
+.logo-mark { font-size: 11px; letter-spacing: 0.15em; color: var(--green); font-weight: 600; }
+.logo-sub { font-size: 10px; color: var(--muted); margin-top: 2px; letter-spacing: 0.05em; }
+.nav { flex: 1; padding: 8px 0; }
+.nav-item { display: flex; align-items: center; gap: 10px; padding: 9px 16px; cursor: pointer; color: var(--muted); font-size: 12px; letter-spacing: 0.03em; transition: all 0.15s; border-left: 2px solid transparent; }
+.nav-item:hover { color: var(--text); background: var(--surface2); }
+.nav-item.active { color: var(--green); background: var(--green-dim); border-left-color: var(--green); }
+.nav-icon { font-size: 14px; width: 16px; text-align: center; }
+.nav-badge { margin-left: auto; background: var(--red); color: #fff; font-size: 9px; padding: 1px 5px; border-radius: 8px; font-weight: 700; }
+.sidebar-footer { padding: 12px 16px; border-top: 1px solid var(--border); }
+.status-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--green); margin-right: 6px; animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+.status-label { font-size: 10px; color: var(--muted); }
+
+/* MAIN */
+.main { flex: 1; overflow-y: auto; background: var(--bg); }
+.page { display: none; padding: 24px; animation: fadeIn 0.2s; }
+.page.active { display: block; }
+@keyframes fadeIn { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:none} }
+.page-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+.page-title { font-size: 16px; font-weight: 600; color: var(--text); letter-spacing: -0.01em; }
+.page-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.run-btn { background: var(--green-dim); border: 1px solid var(--green); color: var(--green); font-family: var(--mono); font-size: 11px; padding: 7px 14px; cursor: pointer; border-radius: 4px; letter-spacing: 0.05em; transition: all 0.15s; }
+.run-btn:hover { background: var(--green); color: #0d1a12; }
+
+/* KPI GRID */
+.kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+.kpi { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; }
+.kpi-label { font-size: 10px; color: var(--muted); letter-spacing: 0.08em; text-transform: uppercase; }
+.kpi-value { font-size: 28px; font-weight: 700; margin: 4px 0 2px; }
+.kpi-delta { font-size: 10px; color: var(--muted); }
+.kpi.green .kpi-value { color: var(--green); }
+.kpi.amber .kpi-value { color: var(--amber); }
+.kpi.blue .kpi-value { color: var(--blue); }
+.kpi.purple .kpi-value { color: var(--purple); }
+
+/* TWO COL */
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 16px; }
+.panel-title { font-size: 11px; color: var(--muted); letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 12px; }
+
+/* BAR CHART */
+.bar-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.bar-label { font-size: 11px; color: var(--muted); width: 90px; text-align: right; }
+.bar-track { flex: 1; height: 8px; background: var(--surface3); border-radius: 4px; overflow: hidden; }
+.bar-fill { height: 100%; border-radius: 4px; transition: width 0.6s ease; }
+.bar-count { font-size: 11px; color: var(--text); width: 24px; text-align: right; }
+
+/* TOP MATCHES */
+.match-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); }
+.match-row:last-child { border-bottom: none; }
+.match-score { font-size: 18px; font-weight: 700; width: 44px; }
+.match-score.high { color: var(--green); }
+.match-score.mid { color: var(--amber); }
+.match-score.low { color: var(--red); }
+.match-cargo { font-size: 12px; color: var(--text); }
+.match-empresa { font-size: 10px; color: var(--muted); }
+.match-badge { margin-left: auto; font-size: 9px; padding: 2px 7px; border-radius: 3px; letter-spacing: 0.04em; }
+.badge-remote { background: var(--green-dim); color: var(--green); border: 1px solid rgba(0,229,160,0.2); }
+.badge-hybrid { background: var(--amber-dim); color: var(--amber); border: 1px solid rgba(240,192,64,0.2); }
+.badge-onsite { background: var(--red-dim); color: var(--red); border: 1px solid rgba(255,92,106,0.2); }
+
+/* VAGAS TABLE */
+.vagas-filters { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+.filter-btn { background: var(--surface2); border: 1px solid var(--border2); color: var(--muted); font-family: var(--mono); font-size: 10px; padding: 5px 10px; cursor: pointer; border-radius: 3px; letter-spacing: 0.04em; transition: all 0.15s; }
+.filter-btn:hover, .filter-btn.active { color: var(--blue); border-color: var(--blue); background: var(--blue-dim); }
+.search-input { flex: 1; min-width: 180px; background: var(--surface2); border: 1px solid var(--border2); color: var(--text); font-family: var(--mono); font-size: 11px; padding: 5px 10px; border-radius: 3px; outline: none; }
+.search-input:focus { border-color: var(--blue); }
+.vagas-table { width: 100%; border-collapse: collapse; }
+.vagas-table th { font-size: 10px; color: var(--muted); letter-spacing: 0.08em; text-transform: uppercase; padding: 8px 12px; border-bottom: 1px solid var(--border2); text-align: left; }
+.vagas-table td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 11px; vertical-align: middle; }
+.vagas-table tr:hover td { background: var(--surface2); }
+.score-badge { display: inline-block; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 3px; }
+.score-high { background: var(--green-dim); color: var(--green); }
+.score-mid { background: var(--amber-dim); color: var(--amber); }
+.score-low { background: var(--red-dim); color: var(--red); }
+.tech-tag { display: inline-block; font-size: 9px; background: var(--surface3); color: var(--muted); padding: 1px 5px; border-radius: 2px; margin: 1px; }
+.source-tag { font-size: 10px; color: var(--blue); }
+.row-expand { cursor: pointer; }
+
+/* CANDIDATURAS TIMELINE */
+.timeline { position: relative; padding-left: 24px; }
+.timeline::before { content:''; position: absolute; left: 8px; top: 0; bottom: 0; width: 1px; background: var(--border2); }
+.tl-item { position: relative; margin-bottom: 20px; }
+.tl-dot { position: absolute; left: -20px; top: 4px; width: 10px; height: 10px; border-radius: 50%; border: 2px solid; }
+.tl-dot.sent { border-color: var(--blue); background: var(--blue-dim); }
+.tl-dot.viewed { border-color: var(--amber); background: var(--amber-dim); }
+.tl-dot.interview { border-color: var(--green); background: var(--green-dim); }
+.tl-dot.rejected { border-color: var(--red); background: var(--red-dim); }
+.tl-date { font-size: 10px; color: var(--muted); margin-bottom: 4px; }
+.tl-cargo { font-size: 13px; color: var(--text); font-weight: 500; }
+.tl-empresa { font-size: 11px; color: var(--muted); }
+.tl-status { font-size: 10px; padding: 2px 7px; border-radius: 3px; display: inline-block; margin-top: 5px; }
+.status-sent { background: var(--blue-dim); color: var(--blue); }
+.status-viewed { background: var(--amber-dim); color: var(--amber); }
+.status-interview { background: var(--green-dim); color: var(--green); }
+.status-rejected { background: var(--red-dim); color: var(--red); }
+
+/* EXTRAS (dados reais) */
+a { color: var(--blue); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.empty { color: var(--muted); font-size: 11px; padding: 12px 0; }
+.tl-dot.aplicada { border-color: var(--blue); background: var(--blue-dim); }
+.tl-dot.em_processo { border-color: var(--green); background: var(--green-dim); }
+.tl-dot.aprovada { border-color: var(--green); background: var(--green); }
+.tl-dot.reprovada { border-color: var(--red); background: var(--red-dim); }
+.status-aplicada { background: var(--blue-dim); color: var(--blue); }
+.status-em_processo, .status-aprovada { background: var(--green-dim); color: var(--green); }
+.status-reprovada { background: var(--red-dim); color: var(--red); }
+.status-nova { background: var(--surface3); color: var(--muted); }
+.badge-neutral { background: var(--surface3); color: var(--muted); border: 1px solid var(--border2); }
+.mini-table { width: 100%; border-collapse: collapse; }
+.mini-table td { padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 11px; color: var(--muted); }
+.mini-table td.v { color: var(--text); text-align: right; white-space: nowrap; }
+@media (max-width: 760px) {
+  .shell { flex-direction: column; height: auto; overflow: visible; }
+  .sidebar { width: 100%; min-width: 0; }
+  .nav { display: flex; flex-wrap: wrap; }
+  .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+  .kpi-value { font-size: 22px; white-space: nowrap; }
+  .two-col { grid-template-columns: 1fr; }
+  .vagas-table th:nth-child(4), .vagas-table td:nth-child(4) { display: none; }
+}
+
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="sidebar">
+    <div class="logo">
+      <div class="logo-mark">AUTOAPPLY_AI</div>
+      <div class="logo-sub">assistente de carreira</div>
+    </div>
+    <nav class="nav">
+      <div class="nav-item active" onclick="showPage('dashboard',this)"><span class="nav-icon">◈</span> Dashboard</div>
+      <div class="nav-item" onclick="showPage('vagas',this)"><span class="nav-icon">◇</span> Vagas <span class="nav-badge" id="badge-vagas"></span></div>
+      <div class="nav-item" onclick="showPage('candidaturas',this)"><span class="nav-icon">◻</span> Candidaturas</div>
+      <div class="nav-item" onclick="showPage('financeiro',this)"><span class="nav-icon">$</span> Financeiro</div>
+      <div class="nav-item" onclick="showPage('certificados',this)"><span class="nav-icon">✦</span> Certificados</div>
+    </nav>
+    <div class="sidebar-footer">
+      <span class="status-dot"></span>
+      <span class="status-label" id="gerado-em"></span>
+    </div>
+  </div>
+
+  <div class="main">
+    <div id="page-dashboard" class="page active">
+      <div class="page-header">
+        <div><div class="page-title">Dashboard</div><div class="page-sub" id="janela"></div></div>
+      </div>
+      <div class="kpi-grid">
+        <div class="kpi green"><div class="kpi-label">Vagas</div><div class="kpi-value" id="kpi-vagas"></div><div class="kpi-delta" id="kpi-vagas-sub"></div></div>
+        <div class="kpi amber"><div class="kpi-label">Score médio</div><div class="kpi-value" id="kpi-score"></div><div class="kpi-delta">vagas com score</div></div>
+        <div class="kpi blue"><div class="kpi-label">Candidaturas</div><div class="kpi-value" id="kpi-cand"></div><div class="kpi-delta" id="kpi-cand-sub"></div></div>
+        <div class="kpi purple"><div class="kpi-label">Despesas</div><div class="kpi-value" id="kpi-desp"></div><div class="kpi-delta" id="kpi-desp-sub"></div></div>
+      </div>
+      <div class="two-col">
+        <div class="panel"><div class="panel-title">Vagas por fonte</div><div id="por-fonte"></div></div>
+        <div class="panel"><div class="panel-title">Top 5 matches</div><div id="top-matches"></div></div>
+      </div>
+      <div class="two-col">
+        <div class="panel"><div class="panel-title">Tecnologias mais pedidas</div><div id="top-techs"></div></div>
+        <div class="panel"><div class="panel-title">Alertas de acesso</div><div id="alertas"></div></div>
+      </div>
+    </div>
+
+    <div id="page-vagas" class="page">
+      <div class="page-header">
+        <div><div class="page-title">Vagas</div><div class="page-sub" id="vagas-sub"></div></div>
+      </div>
+      <div class="vagas-filters">
+        <input class="search-input" placeholder="buscar cargo, empresa, tech..." id="vaga-search" oninput="filterVagas()">
+        <button class="filter-btn active" onclick="setFilter(this,'all')">Todas</button>
+        <button class="filter-btn" onclick="setFilter(this,'python')">Python</button>
+        <button class="filter-btn" onclick="setFilter(this,'dados')">Dados</button>
+        <button class="filter-btn" onclick="setFilter(this,'remoto')">Remoto</button>
+        <button class="filter-btn" onclick="setFilter(this,'75+')">Score ≥75</button>
+      </div>
+      <div class="panel" style="padding:0; overflow-x:auto;">
+        <table class="vagas-table">
+          <thead><tr><th>Score</th><th>Cargo</th><th>Empresa</th><th>Tecnologias</th><th>Modelo</th><th>Status</th><th>Fonte</th></tr></thead>
+          <tbody id="vagas-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div id="page-candidaturas" class="page">
+      <div class="page-header">
+        <div><div class="page-title">Candidaturas</div><div class="page-sub">Vagas que saíram do status "nova"</div></div>
+      </div>
+      <div class="panel"><div class="panel-title">Timeline</div><div class="timeline" id="timeline"></div></div>
+    </div>
+
+    <div id="page-financeiro" class="page">
+      <div class="page-header">
+        <div><div class="page-title">Financeiro</div><div class="page-sub">Faturas, boletos e recibos lidos dos e-mails</div></div>
+      </div>
+      <div class="panel"><table class="mini-table" id="despesas"></table></div>
+    </div>
+
+    <div id="page-certificados" class="page">
+      <div class="page-header">
+        <div><div class="page-title">Certificados</div><div class="page-sub">Salvos no Google Drive</div></div>
+      </div>
+      <div class="panel"><table class="mini-table" id="certificados"></table></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const DADOS = /*__DADOS__*/{};
+
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const url = u => /^https?:\/\//i.test(u || '') ? esc(u) : null;
+const scoreCls = s => s >= 75 ? 'high' : s >= 50 ? 'mid' : 'low';
+const modeloCls = m => m === 'Remoto' ? 'badge-remote' : m === 'Híbrido' ? 'badge-hybrid' : m === 'Presencial' ? 'badge-onsite' : 'badge-neutral';
+const STATUS = {nova:'nova', aplicada:'aplicada', em_processo:'em processo', reprovada:'reprovada', aprovada:'aprovada'};
+const vazio = msg => `<div class="empty">${msg}</div>`;
+
+function showPage(name, el) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.getElementById('page-' + name).classList.add('active');
+  el.classList.add('active');
+}
+
+function renderResumo() {
+  const k = DADOS.kpis;
+  document.getElementById('gerado-em').textContent = 'gerado em ' + DADOS.gerado_em;
+  document.getElementById('janela').textContent = `Últimos ${DADOS.dias} dias`;
+  document.getElementById('kpi-vagas').textContent = k.vagas;
+  document.getElementById('kpi-vagas-sub').textContent = `${k.vagas_alta} com score ≥75`;
+  document.getElementById('kpi-score').textContent = k.score_medio === null ? '—' : k.score_medio + '%';
+  document.getElementById('kpi-cand').textContent = k.candidaturas;
+  document.getElementById('kpi-cand-sub').textContent = `${k.em_processo} em processo`;
+  document.getElementById('kpi-desp').textContent = k.despesas_total;
+  document.getElementById('kpi-desp-sub').textContent = `${k.despesas} lançamento(s)`;
+  document.getElementById('badge-vagas').textContent = k.vagas || '';
+
+  const max = Math.max(1, ...DADOS.por_fonte.map(f => f.n));
+  const cores = ['--blue','--purple','--amber','--green','--red'];
+  document.getElementById('por-fonte').innerHTML = DADOS.por_fonte.length ? DADOS.por_fonte.map((f, i) =>
+    `<div class="bar-row"><span class="bar-label">${esc(f.fonte)}</span><div class="bar-track"><div class="bar-fill" style="width:${Math.round(100*f.n/max)}%;background:var(${cores[i % cores.length]})"></div></div><span class="bar-count">${f.n}</span></div>`
+  ).join('') : vazio('Nenhuma vaga na janela.');
+
+  const maxT = Math.max(1, ...DADOS.top_techs.map(t => t.n));
+  document.getElementById('top-techs').innerHTML = DADOS.top_techs.length ? DADOS.top_techs.map(t =>
+    `<div class="bar-row"><span class="bar-label">${esc(t.tech)}</span><div class="bar-track"><div class="bar-fill" style="width:${Math.round(100*t.n/maxT)}%;background:var(--green)"></div></div><span class="bar-count">${t.n}</span></div>`
+  ).join('') : vazio('Sem tecnologias detectadas.');
+
+  const top = DADOS.vagas.filter(v => v.score > 0).slice(0, 5);
+  document.getElementById('top-matches').innerHTML = top.length ? top.map(v => {
+    const link = url(v.link);
+    const cargo = link ? `<a href="${link}" target="_blank" rel="noopener">${esc(v.cargo)}</a>` : esc(v.cargo);
+    return `<div class="match-row"><div class="match-score ${scoreCls(v.score)}">${v.score}%</div><div><div class="match-cargo">${cargo}</div><div class="match-empresa">${esc(v.empresa || '—')}${v.local ? ' · ' + esc(v.local) : ''}</div></div><span class="match-badge ${modeloCls(v.modelo)}">${esc(v.modelo || '—')}</span></div>`;
+  }).join('') : vazio('Nenhuma vaga com score ainda.');
+
+  document.getElementById('alertas').innerHTML = DADOS.alertas.length ? '<table class="mini-table">' + DADOS.alertas.map(a =>
+    `<tr><td>${esc(a.data)} · ${esc(a.plataforma)}</td><td class="v">${esc(a.tipo)}</td></tr>`).join('') + '</table>'
+    : vazio('Nenhum alerta na janela.');
+}
+
+let filtro = 'all';
+function filterVagas() {
+  const q = document.getElementById('vaga-search').value.toLowerCase();
+  const DADOS_TECHS = ['sql','power bi','powerbi','dax','etl','tableau','data science','excel'];
+  let lista = DADOS.vagas.filter(v => {
+    if (filtro === 'python') return v.techs.includes('python');
+    if (filtro === 'dados') return v.techs.some(t => DADOS_TECHS.includes(t));
+    if (filtro === 'remoto') return v.modelo === 'Remoto';
+    if (filtro === '75+') return v.score >= 75;
+    return true;
+  });
+  if (q) lista = lista.filter(v => [v.cargo, v.empresa, ...v.techs].some(x => (x || '').toLowerCase().includes(q)));
+  document.getElementById('vagas-tbody').innerHTML = lista.map(v => {
+    const link = url(v.link);
+    const cargo = link ? `<a href="${link}" target="_blank" rel="noopener">${esc(v.cargo)}</a>` : esc(v.cargo);
+    return `<tr><td><span class="score-badge score-${scoreCls(v.score)}">${v.score}%</span></td>`
+      + `<td style="color:var(--text);font-size:12px">${cargo}</td><td style="color:var(--muted)">${esc(v.empresa || '—')}</td>`
+      + `<td>${v.techs.map(t => `<span class="tech-tag">${esc(t)}</span>`).join('')}</td>`
+      + `<td><span class="match-badge ${modeloCls(v.modelo)}">${esc(v.modelo || '—')}</span></td>`
+      + `<td><span class="tl-status status-${esc(v.status)}">${esc(STATUS[v.status] || v.status)}</span></td>`
+      + `<td><span class="source-tag">${esc(v.fonte)}</span></td></tr>`;
+  }).join('') || `<tr><td colspan="7">${vazio('Nenhuma vaga com esse filtro.')}</td></tr>`;
+  document.getElementById('vagas-sub').textContent = `${lista.length} de ${DADOS.vagas.length} vagas`;
+}
+function setFilter(el, f) {
+  filtro = f;
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  el.classList.add('active');
+  filterVagas();
+}
+
+function renderCandidaturas() {
+  const c = DADOS.vagas.filter(v => v.status !== 'nova');
+  document.getElementById('timeline').innerHTML = c.length ? c.map(v =>
+    `<div class="tl-item"><div class="tl-dot ${esc(v.status)}"></div><div class="tl-date">${esc(v.data)}</div>`
+    + `<div class="tl-cargo">${esc(v.cargo)}</div><div class="tl-empresa">${esc(v.empresa || '—')}</div>`
+    + `<span class="tl-status status-${esc(v.status)}">${esc(STATUS[v.status] || v.status)}</span></div>`
+  ).join('') : vazio('Nenhuma candidatura registrada ainda — elas aparecem quando chegam e-mails de "candidatura enviada" ou "avançou de fase".');
+}
+
+function renderTabelas() {
+  document.getElementById('despesas').innerHTML = DADOS.despesas.length ? DADOS.despesas.map(d =>
+    `<tr><td>${esc(d.estabelecimento)}<br><span style="color:var(--faint)">${esc(d.categoria)} · venc. ${esc(d.vencimento || '—')}</span></td><td class="v">${esc(d.valor)}</td></tr>`).join('')
+    : `<tr><td>${vazio('Nenhuma despesa na janela.')}</td></tr>`;
+  document.getElementById('certificados').innerHTML = DADOS.certificados.length ? DADOS.certificados.map(c => {
+    const link = url(c.link);
+    const nome = link ? `<a href="${link}" target="_blank" rel="noopener">${esc(c.curso)}</a>` : esc(c.curso);
+    return `<tr><td>${nome}<br><span style="color:var(--faint)">${esc(c.plataforma)} · ${esc(c.data)}</span></td><td class="v">${esc(c.status)}</td></tr>`;
+  }).join('') : `<tr><td>${vazio('Nenhum certificado na janela.')}</td></tr>`;
+}
+
+renderResumo();
+filterVagas();
+renderCandidaturas();
+renderTabelas();
+</script>
+</body>
+</html>

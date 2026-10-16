@@ -5,6 +5,7 @@ Mantém o AutoApply AI rodando sozinho (no Docker ou num servidor), sem cron:
 
   - alertas (OTP)       a cada ALERTAS_INTERVALO_MIN    (padrão: 1 min)
   - pipeline completo   a cada PIPELINE_INTERVALO_MIN   (padrão: 30 min)
+  - dashboard           regenerado logo após cada pipeline
   - briefing diário     todo dia às BRIEFING_HORARIO    (padrão: 07:30; vazio desliga)
 
 As tarefas rodam UMA DE CADA VEZ, cada uma num subprocesso: um erro (ou
@@ -60,6 +61,8 @@ def montar_tarefas(agora: datetime.datetime) -> list[Tarefa]:
     tarefas = [
         # O pipeline completo vem primeiro: na largada ele já cobre os alertas.
         Tarefa("pipeline", ["main.py"], intervalo_min=PIPELINE_INTERVALO_MIN, proxima=agora),
+        # Dashboard logo depois do pipeline, com os dados recém-gravados
+        Tarefa("dashboard", ["gerar_dashboard.py"], intervalo_min=PIPELINE_INTERVALO_MIN, proxima=agora),
         Tarefa("alertas", ["main.py", "--modulo", "alertas"], intervalo_min=ALERTAS_INTERVALO_MIN,
                proxima=agora + datetime.timedelta(minutes=ALERTAS_INTERVALO_MIN)),
     ]

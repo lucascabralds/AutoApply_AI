@@ -15,7 +15,7 @@ def test_proximo_horario_hoje_ou_amanha():
 def test_largada_roda_pipeline_e_agenda_o_resto():
     agora = dt.datetime(2026, 10, 16, 6, 0)
     tarefas = agendador.montar_tarefas(agora)
-    assert [t.nome for t in agendador.tarefas_vencidas(tarefas, agora)] == ["pipeline"]
+    assert [t.nome for t in agendador.tarefas_vencidas(tarefas, agora)] == ["pipeline", "dashboard"]
     nomes = {t.nome: t for t in tarefas}
     assert nomes["briefing"].proxima == dt.datetime(2026, 10, 16, 7, 30)
 
