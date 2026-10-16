@@ -495,8 +495,8 @@ def main():
         help="Apenas imprime no terminal, não envia o e-mail",
     )
     parser.add_argument(
-        "--para", type=str, default="me",
-        help="Endereço de destino (padrão: próprio Gmail)",
+        "--para", type=str, default=DESTINATARIO,
+        help="Endereço de destino (padrão: BRIEFING_DESTINATARIO do .env ou o próprio Gmail)",
     )
     args = parser.parse_args()
 
