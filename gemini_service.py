@@ -517,6 +517,54 @@ Corpo: {corpo[:800]}
 
 
 # ---------------------------------------------------------------------------
+# 5. CARTA DE APRESENTAÇÃO (rascunho de candidatura)
+# ---------------------------------------------------------------------------
+
+def gerar_carta_apresentacao(vaga: dict, perfil: str) -> str:
+    """
+    Escreve uma carta curta e específica para a vaga, usando SÓ fatos do
+    perfil (a IA não pode inventar experiência). Retorna texto puro, ou ""
+    em caso de falha.
+    """
+    detalhes = "\n".join(
+        f"- {rotulo}: {valor}" for rotulo, valor in [
+            ("Cargo", vaga.get("cargo")),
+            ("Empresa", vaga.get("empresa")),
+            ("Local", vaga.get("local")),
+            ("Modelo", vaga.get("modelo_trabalho")),
+            ("Requisitos", ", ".join(vaga.get("requisitos") or [])),
+            ("Tecnologias", ", ".join(vaga.get("tecnologias") or [])),
+        ] if valor
+    )
+    prompt = f"""
+Você escreve cartas de apresentação curtas para candidaturas a vagas de tecnologia.
+
+PERFIL DO CANDIDATO (única fonte de fatos permitida):
+{perfil[:6000]}
+
+VAGA:
+{detalhes}
+
+REGRAS:
+- Português do Brasil, tom técnico, direto e sem clichês (siga as diretrizes de comunicação do perfil).
+- Máximo de 170 palavras, 3 parágrafos curtos, saudação "Olá," e assinatura com o nome do candidato.
+- Conecte 2 ou 3 requisitos/tecnologias da vaga a experiências ou projetos REAIS do perfil.
+- NUNCA invente experiência, tempo de carreira, certificação ou tecnologia que não esteja no perfil.
+  Se um requisito não aparece no perfil, não o mencione.
+- Não use markdown, emojis nem colchetes de preenchimento — o texto sai pronto para enviar.
+
+Responda apenas com o texto da carta.
+"""
+    try:
+        texto = _chamar_gemini(prompt).strip()
+    except Exception as e:
+        logger.warning(f"gerar_carta_apresentacao falhou: {e}")
+        return ""
+    # Remove cercas de markdown que alguns modelos insistem em usar
+    return re.sub(r"^```\w*\s*|\s*```$", "", texto).strip()
+
+
+# ---------------------------------------------------------------------------
 # Uso standalone — testa todas as funções com dados reais
 # ---------------------------------------------------------------------------
 

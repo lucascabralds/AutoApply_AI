@@ -63,6 +63,7 @@ import google_auth
 from notificador import enviar_telegram, escapar_html, telegram_configurado
 from seguranca import redigir_segredo
 from services.gmail.add_task import criar_tarefa_vaga
+import candidatura
 
 # ---------------------------------------------------------------------------
 # Supabase
@@ -105,6 +106,7 @@ _BUDGET_LIMITE = {
     "vagas":   int(os.getenv("GEMINI_BUDGET_VAGAS",   "40")),
     "geral":   int(os.getenv("GEMINI_BUDGET_GERAL",   "10")),
     "alertas": int(os.getenv("GEMINI_BUDGET_ALERTAS", "10")),
+    "cartas":  int(os.getenv("GEMINI_BUDGET_CARTAS",  "5")),
 }
 
 # Carrega cache em memória uma vez por execução
@@ -143,7 +145,7 @@ def _carregar_budget() -> dict:
                 return dados
     except Exception:
         pass
-    return {"data": hoje, "vagas": 0, "geral": 0, "alertas": 0}
+    return {"data": hoje, "vagas": 0, "geral": 0, "alertas": 0, "cartas": 0}
 
 def _salvar_budget(budget: dict) -> None:
     try:
@@ -160,7 +162,7 @@ def _virar_dia_do_budget() -> None:
     hoje = datetime.date.today().isoformat()
     if _GEMINI_BUDGET.get("data") != hoje:
         _GEMINI_BUDGET.clear()
-        _GEMINI_BUDGET.update({"data": hoje, "vagas": 0, "geral": 0, "alertas": 0})
+        _GEMINI_BUDGET.update({"data": hoje, "vagas": 0, "geral": 0, "alertas": 0, "cartas": 0})
 
 
 def _tem_budget(modulo: str) -> bool:
@@ -179,7 +181,8 @@ def _status_budget() -> str:
     return (
         f"vagas {b.get('vagas',0)}/{lim['vagas']} | "
         f"geral {b.get('geral',0)}/{lim['geral']} | "
-        f"alertas {b.get('alertas',0)}/{lim['alertas']}"
+        f"alertas {b.get('alertas',0)}/{lim['alertas']} | "
+        f"cartas {b.get('cartas',0)}/{lim['cartas']}"
     )
 
 # ===========================================================================
@@ -1195,6 +1198,7 @@ from gemini_service import (
     extrair_vagas           as _gs_extrair_vagas,
     analisar_acesso         as _gs_analisar_acesso,
     classificar_email_geral as _gs_classificar_geral,
+    gerar_carta_apresentacao as _gs_gerar_carta,
 )
 
 _PALAVRAS_AGENDAMENTO = ["agendamento", "confirmado", "reserva", "horário", "consulta", "appointment"]
@@ -1380,6 +1384,41 @@ def notificar_vaga(vaga: dict) -> None:
     enviar_telegram("\n".join(linhas))
 
 
+def preparar_rascunho_candidatura(service, vaga: dict, texto_email: str) -> str | None:
+    """
+    Gera a carta (IA) e cria o rascunho no Gmail para uma vaga de score alto.
+    Uma vez por vaga (marcado no cache) e dentro do budget diário "cartas".
+    Retorna o id do rascunho ou None.
+    """
+    uid = _vaga_uid(vaga.get("email_id"), vaga.get("cargo"), vaga.get("empresa"))
+    if _cache_get("rascunho", uid, str):
+        return None
+    if not _tem_budget("cartas") or not gateway_disponivel():
+        return None
+    perfil = candidatura.carregar_perfil()
+    if not perfil:
+        Log.warn(f"  Perfil não encontrado em {candidatura.PERFIL_PATH} — rascunho não gerado")
+        return None
+
+    carta = _gs_gerar_carta(vaga, perfil)
+    _consumir_budget("cartas")
+    if not carta:
+        return None
+
+    msg = candidatura.montar_mensagem(
+        vaga, carta,
+        destinatario=candidatura.extrair_email_recrutador(texto_email),
+        curriculo_pdf=candidatura.CURRICULO_PDF or None,
+    )
+    try:
+        rascunho_id = candidatura.criar_rascunho(service, msg)
+    except HttpError as e:
+        Log.warn(f"  Falha ao criar rascunho de candidatura: {e}")
+        return None
+    _cache_set("rascunho", uid, rascunho_id or "ok")
+    return rascunho_id
+
+
 def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: bool,
                 tasks_service=None):
     Log.section("Módulo 1 — Extração de Vagas")
@@ -1510,6 +1549,13 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
                 notificar_vaga(vaga)
                 if tasks_service and criar_tarefa_vaga(tasks_service, vaga):
                     Log.ok("      ✅ Follow-up criado no Google Tasks")
+
+            if candidatura.deve_gerar_rascunho(vaga) and not dry_run:
+                # Num digest o e-mail do recrutador não é confiável por vaga
+                mailtos = " ".join(re.findall(r'mailto:([^"?\s>]+)', html_bruto or ""))
+                texto_recrutador = f"{corpo} {mailtos}" if len(vagas_extraidas) == 1 else ""
+                if preparar_rascunho_candidatura(service, vaga, texto_recrutador):
+                    Log.ok("      ✉️  Rascunho de candidatura criado no Gmail")
 
             time.sleep(0.5)  # throttle entre vagas do mesmo e-mail
 

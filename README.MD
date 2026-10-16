@@ -45,6 +45,7 @@ O algoritmo monitora ativamente a conta do Gmail e realiza a extração e o proc
 | `agendador.py` | Roda alertas, pipeline e briefing em horários definidos (usado no Docker). |
 | `notificador.py` | Envio de mensagens pelo Telegram. |
 | `seguranca.py` | Redação de OTPs e links de recuperação antes de gravar/enviar. |
+| `candidatura.py` | Rascunhos de candidatura no Gmail: carta gerada pela IA a partir do perfil + currículo anexado. |
 | `services/gmail/add_task.py` | Follow-ups de vagas no Google Tasks. |
 | `supabase/schema.sql` | Schema idempotente de todas as tabelas. |
 | `tests/` | Testes automatizados (`pytest`), rodando no GitHub Actions. |
@@ -142,6 +143,7 @@ AutoApply/Geral/Servicos             demais notificações
 - [x] Follow-ups automáticos de vagas no Google Tasks
 - [x] Briefing diário por e-mail
 - [x] Testes automatizados + CI
+- [x] Rascunhos de candidatura (Fase 3, com revisão humana): carta personalizada + currículo anexado, endereçada ao recrutador quando o e-mail aparece na vaga
 - [x] Dashboard com dados reais do Supabase (antes: protótipo com dados fictícios)
 - [x] Docker + agendador (alertas a cada minuto, pipeline a cada 30 min, briefing diário)
 - [x] Status de candidatura: "sua candidatura foi enviada" / "você avançou de fase" atualizam a vaga existente (nova → aplicada → em_processo → reprovada/aprovada), sem duplicar
@@ -149,7 +151,7 @@ AutoApply/Geral/Servicos             demais notificações
 **Próximos passos**
 1. **Automação de Finanças:** cruzar `despesas_domesticas` com as planilhas financeiras existentes.
 2. **Monitoramento Automotivo e Burocrático:** Detran, IPVA, licenciamento → Google Calendar + Drive.
-3. **Disparo Automatizado (`messages.send`):** anexar o currículo e candidatar-se ativamente às vagas de score alto.
+3. **Envio automático opcional** dos rascunhos de candidatura, depois de algumas semanas validando a qualidade das cartas.
 
 ---
 
