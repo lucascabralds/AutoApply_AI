@@ -127,14 +127,14 @@ AutoApply/Geral/Servicos             demais notificações
 - [x] Follow-ups automáticos de vagas no Google Tasks
 - [x] Briefing diário por e-mail
 - [x] Testes automatizados + CI
+- [x] Status de candidatura: "sua candidatura foi enviada" / "você avançou de fase" atualizam a vaga existente (nova → aplicada → em_processo → reprovada/aprovada), sem duplicar
 
 **Próximos passos**
 1. **Dashboard com dados reais:** ligar o `autoapply_ai_dashboard.html` (hoje com dados fictícios) às tabelas do Supabase.
-2. **Status de candidatura:** quando chegar "sua candidatura foi enviada" / "você avançou de fase", atualizar a vaga correspondente em vez de criar outra.
-3. **Automação de Finanças:** cruzar `despesas_domesticas` com as planilhas financeiras existentes.
-4. **Monitoramento Automotivo e Burocrático:** Detran, IPVA, licenciamento → Google Calendar + Drive.
-5. **Containerização (Docker)** com agendamento (cron) do `main.py` e do briefing.
-6. **Disparo Automatizado (`messages.send`):** anexar o currículo e candidatar-se ativamente às vagas de score alto.
+2. **Automação de Finanças:** cruzar `despesas_domesticas` com as planilhas financeiras existentes.
+3. **Monitoramento Automotivo e Burocrático:** Detran, IPVA, licenciamento → Google Calendar + Drive.
+4. **Containerização (Docker)** com agendamento (cron) do `main.py` e do briefing.
+5. **Disparo Automatizado (`messages.send`):** anexar o currículo e candidatar-se ativamente às vagas de score alto.
 
 ---
 

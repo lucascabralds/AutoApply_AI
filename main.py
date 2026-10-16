@@ -911,6 +911,74 @@ def salvar_vaga(sb: Client | None, vaga: dict, dry_run: bool = False) -> bool:
     return _sb_upsert_insert(sb, "vagas_extraidas", registro_legado, "gmail_message_id")
 
 
+# Funil de candidatura — o status de uma vaga só avança, nunca regride
+# (um "retorno" atrasado não pode desfazer um "avançou de fase").
+_ORDEM_STATUS = {"nova": 0, "aplicada": 1, "em_processo": 2, "reprovada": 3, "aprovada": 3}
+
+
+def _status_do_email(tipo_email: str | None, status_candidatura: str | None) -> str:
+    """Traduz o tipo de e-mail classificado pela IA para o status da vaga no banco."""
+    if tipo_email == "candidatura_enviada":
+        return "aplicada"
+    if tipo_email == "avanco_fase":
+        return "em_processo"
+    if tipo_email == "retorno":
+        return "reprovada" if status_candidatura == "reprovado" else "em_processo"
+    return "nova"
+
+
+def _empresa_conhecida(empresa: str | None) -> bool:
+    return bool(empresa) and not empresa.lower().startswith("não identificada")
+
+
+def atualizar_status_vaga(sb: Client | None, vaga: dict, novo_status: str) -> bool:
+    """
+    E-mails de acompanhamento ("sua candidatura foi enviada", "você avançou
+    de fase"...) não são vagas novas: procura a vaga já salva com a mesma
+    empresa e cargo parecido e só avança o status_aplicacao dela.
+    Retorna True se encontrou a vaga (mesmo que o status já estivesse à frente).
+    """
+    if not sb or _SCHEMA_VAGAS_V3 is False:
+        return False
+    empresa, cargo = vaga.get("empresa"), vaga.get("cargo") or ""
+    if not _empresa_conhecida(empresa):
+        return False
+    padrao = re.sub(r"[%_*,()]", " ", empresa).strip()
+    try:
+        res = (
+            sb.table("vagas_extraidas")
+            .select("id, cargo, empresa, status_aplicacao")
+            .ilike("empresa", f"%{padrao}%")
+            .order("created_at", desc=True)
+            .limit(50)
+            .execute()
+        )
+    except Exception as e:
+        Log.warn(f"  Busca da vaga para atualizar status falhou: {e}")
+        return False
+
+    def _mesmo_cargo(outro: str | None) -> bool:
+        a, b = _normalizar_para_match(cargo), _normalizar_para_match(outro)
+        return bool(a and b) and (a in b or b in a)
+
+    candidatas = [r for r in (res.data or []) if _mesmo_cargo(r.get("cargo"))]
+    if not candidatas:
+        return False
+
+    linha = candidatas[0]   # a mais recente
+    atual = linha.get("status_aplicacao") or "nova"
+    if _ORDEM_STATUS.get(novo_status, 0) <= _ORDEM_STATUS.get(atual, 0):
+        Log.info(f"    ↺ {linha['cargo']} @ {linha['empresa']} já está em '{atual}'")
+        return True
+    try:
+        sb.table("vagas_extraidas").update({"status_aplicacao": novo_status}).eq("id", linha["id"]).execute()
+    except Exception as e:
+        Log.warn(f"  Atualização de status falhou: {e}")
+        return False
+    Log.ok(f"    ↗ {linha['cargo']} @ {linha['empresa']}: {atual} → {novo_status}")
+    return True
+
+
 def salvar_certificado(sb: Client | None, cert: dict, dry_run: bool = False) -> bool:
     if dry_run:
         Log.info(f"  [DRY-RUN] certificados_portfolio: {cert.get('nome_curso') or cert.get('assunto')}")
@@ -1320,6 +1388,7 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
     total_vagas   = 0
     total_salvas  = 0
     total_outros  = 0
+    total_atualizadas = 0
 
     for msg in msgs:
         try:
@@ -1405,8 +1474,16 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
                 "link_candidatura":  link,
                 "descricao":         corpo[:400] if corpo else "",
                 "data_email":        data,
-                "status":            "nova",
+                "status":            _status_do_email(vaga_raw.get("tipo_email"),
+                                                      vaga_raw.get("status_candidatura")),
             }
+
+            # E-mail de acompanhamento de uma candidatura já conhecida →
+            # atualiza a vaga existente em vez de criar uma duplicada.
+            if (vaga["tipo_email"] != "nova_vaga" and not dry_run
+                    and atualizar_status_vaga(sb, vaga, vaga["status"])):
+                total_atualizadas += 1
+                continue
 
             salvo = salvar_vaga(sb, vaga, dry_run)
             if salvo:
@@ -1437,7 +1514,8 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
 
     Log.section(
         f"Vagas: {total_emails} e-mails | {total_vagas} vagas | "
-        f"{total_salvas} salvas | {total_outros} outros módulos"
+        f"{total_salvas} salvas | {total_atualizadas} status atualizados | "
+        f"{total_outros} outros módulos"
     )
 
 
