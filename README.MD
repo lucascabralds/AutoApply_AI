@@ -41,6 +41,7 @@ O algoritmo monitora ativamente a conta do Gmail e realiza a extração e o proc
 | `gemini_service.py` | Prompts e parse robusto do JSON da IA (cercas de markdown, vírgulas soltas, respostas truncadas). |
 | `rota_ia_client.py` | Cliente HTTP do gateway Rota.IA com retry em 429/503. |
 | `google_auth.py` | OAuth2 único para todos os scripts (um só `token.json`, com todos os escopos). |
+| `agendador.py` | Roda alertas, pipeline e briefing em horários definidos (usado no Docker). |
 | `notificador.py` | Envio de mensagens pelo Telegram. |
 | `seguranca.py` | Redação de OTPs e links de recuperação antes de gravar/enviar. |
 | `services/gmail/add_task.py` | Follow-ups de vagas no Google Tasks. |
@@ -93,6 +94,17 @@ python briefing_diario.py --preview   # imprime o briefing no terminal
 python briefing_diario.py             # envia o briefing para o seu Gmail
 ```
 
+### 🐳 Rodando sozinho (Docker)
+O `agendador.py` mantém tudo no ar sem cron: alertas a cada 1 min, pipeline completo a cada 30 min e o briefing todo dia às 07:30 (ajuste com `ALERTAS_INTERVALO_MIN`, `PIPELINE_INTERVALO_MIN` e `BRIEFING_HORARIO`).
+
+```bash
+python google_auth.py                       # 1x, na sua máquina: gera o token.json
+mkdir dados && cp credentials.json token.json dados/
+docker compose up -d --build
+docker compose logs -f
+```
+O container roda em modo headless (nunca tenta abrir navegador) e acessa o Rota.IA da máquina host via `host.docker.internal`. Sem Docker, `python agendador.py` faz o mesmo.
+
 Para rodar os testes:
 ```bash
 pip install -r requirements-dev.txt
@@ -127,14 +139,14 @@ AutoApply/Geral/Servicos             demais notificações
 - [x] Follow-ups automáticos de vagas no Google Tasks
 - [x] Briefing diário por e-mail
 - [x] Testes automatizados + CI
+- [x] Docker + agendador (alertas a cada minuto, pipeline a cada 30 min, briefing diário)
 - [x] Status de candidatura: "sua candidatura foi enviada" / "você avançou de fase" atualizam a vaga existente (nova → aplicada → em_processo → reprovada/aprovada), sem duplicar
 
 **Próximos passos**
 1. **Dashboard com dados reais:** ligar o `autoapply_ai_dashboard.html` (hoje com dados fictícios) às tabelas do Supabase.
 2. **Automação de Finanças:** cruzar `despesas_domesticas` com as planilhas financeiras existentes.
 3. **Monitoramento Automotivo e Burocrático:** Detran, IPVA, licenciamento → Google Calendar + Drive.
-4. **Containerização (Docker)** com agendamento (cron) do `main.py` e do briefing.
-5. **Disparo Automatizado (`messages.send`):** anexar o currículo e candidatar-se ativamente às vagas de score alto.
+4. **Disparo Automatizado (`messages.send`):** anexar o currículo e candidatar-se ativamente às vagas de score alto.
 
 ---
 

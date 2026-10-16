@@ -54,3 +54,4 @@ cache_gemini.json
 gemini_budget.json
 /certificados/
 .pytest_cache/
+/dados/

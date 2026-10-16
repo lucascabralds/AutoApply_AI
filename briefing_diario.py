@@ -511,7 +511,7 @@ def main():
     # Gmail
     try:
         service = _autenticar_gmail()
-    except FileNotFoundError as e:
+    except (FileNotFoundError, RuntimeError) as e:
         print(f"[ERRO] {e}")
         sys.exit(1)
 

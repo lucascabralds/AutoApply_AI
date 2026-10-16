@@ -17,6 +17,12 @@ Configuração (.env):
   GMAIL_TOKEN_PATH        — caminho do token.json      (padrão: raiz do projeto)
   GOOGLE_TASKS_ENABLED    — "true" para incluir o escopo do Google Tasks
                             (follow-ups automáticos de vagas)
+  AUTOAPPLY_HEADLESS      — "true" em servidor/Docker: nunca tenta abrir o
+                            navegador; falha com instrução clara se o token
+                            não servir
+
+Para gerar/renovar o token.json (ex.: antes de subir o Docker):
+    python google_auth.py
 """
 
 import json
@@ -34,6 +40,7 @@ _BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 TOKEN_PATH       = os.getenv("GMAIL_TOKEN_PATH",       os.path.join(_BASE_DIR, "token.json"))
 CREDENTIALS_PATH = os.getenv("GMAIL_CREDENTIALS_PATH", os.path.join(_BASE_DIR, "credentials.json"))
 
+HEADLESS      = os.getenv("AUTOAPPLY_HEADLESS", "false").strip().lower() in ("1", "true", "sim", "yes")
 TASKS_ENABLED = os.getenv("GOOGLE_TASKS_ENABLED", "false").strip().lower() in ("1", "true", "sim", "yes")
 
 # gmail.modify cobre leitura, labels E envio (messages.send) — não é preciso
@@ -91,6 +98,13 @@ def obter_credenciais(log=print) -> Credentials:
     else:
         creds = None
 
+    if not creds and HEADLESS:
+        raise RuntimeError(
+            "token.json ausente, inválido ou sem todos os escopos e AUTOAPPLY_HEADLESS=true "
+            "(não há navegador aqui). Rode `python google_auth.py` na sua máquina e copie o "
+            "token.json gerado para este ambiente."
+        )
+
     if not creds:
         log("Abrindo navegador para autenticação OAuth2...")
         flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
@@ -109,3 +123,9 @@ def construir_servicos(*apis: str, log=print) -> tuple:
     versoes = {"gmail": "v1", "drive": "v3", "tasks": "v1"}
     creds = obter_credenciais(log=log)
     return tuple(build(api, versoes[api], credentials=creds) for api in apis)
+
+
+if __name__ == "__main__":
+    obter_credenciais()
+    print(f"✅ token.json pronto em {TOKEN_PATH}")
+    print(f"   Escopos: {', '.join(s.rsplit('/', 1)[-1] for s in SCOPES)}")

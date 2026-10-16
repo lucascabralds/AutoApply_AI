@@ -96,8 +96,10 @@ load_dotenv()
 
 import hashlib
 
-_CACHE_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache_gemini.json")
-_BUDGET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gemini_budget.json")
+# Pasta do estado local (cache + budget). No Docker aponta para o volume /app/dados.
+_DADOS_DIR   = os.getenv("AUTOAPPLY_DADOS_DIR") or os.path.dirname(os.path.abspath(__file__))
+_CACHE_PATH  = os.path.join(_DADOS_DIR, "cache_gemini.json")
+_BUDGET_PATH = os.path.join(_DADOS_DIR, "gemini_budget.json")
 
 _BUDGET_LIMITE = {
     "vagas":   int(os.getenv("GEMINI_BUDGET_VAGAS",   "40")),
@@ -2146,7 +2148,7 @@ def main():
 
     try:
         service, drive_service = autenticar_google()
-    except FileNotFoundError as e:
+    except (FileNotFoundError, RuntimeError) as e:
         Log.error(str(e))
         sys.exit(1)
 
