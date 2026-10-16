@@ -8,9 +8,14 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    # `environment` tem precedência sobre o .env — estes valores valem só no container
     environment:
       # O gateway Rota.IA roda na máquina host, fora do container
       ROTA_IA_URL: ${ROTA_IA_URL_DOCKER:-http://host.docker.internal:8787/v1}
+      AUTOAPPLY_HEADLESS: "true"
+      AUTOAPPLY_DADOS_DIR: /app/dados
+      GMAIL_CREDENTIALS_PATH: /app/dados/credentials.json
+      GMAIL_TOKEN_PATH: /app/dados/token.json
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
