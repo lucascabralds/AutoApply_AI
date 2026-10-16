@@ -175,6 +175,9 @@ def _status_budget() -> str:
 # Escopos, token.json e credentials.json ficam centralizados em google_auth.py
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Máximo de e-mails lidos por módulo em cada execução
+LIMITE_EMAILS = int(os.getenv("LIMITE_EMAILS_POR_MODULO", "100"))
+
 PASTA_CERTIFICADOS = os.getenv("CERTIFICADOS_LOCAL", os.path.join(_BASE_DIR, "certificados"))
 DRIVE_FOLDER_ID    = os.getenv("DRIVE_FOLDER_ID", None)  # ID da pasta no Drive (opcional)
 
@@ -224,6 +227,12 @@ LABEL_TREE = {
     "geral_comunicado":   {"nome": "AutoApply/Geral/Comunicado",         "cor_bg": "#4a86e8", "cor_txt": "#ffffff"},
     "geral_servicos":     {"nome": "AutoApply/Geral/Servicos",           "cor_bg": "#cccccc", "cor_txt": "#000000"},
 }
+
+# Filtro de busca que exclui e-mails já etiquetados por qualquer módulo.
+# Cada módulo aplica sempre a label pai + a sub-label, então basta excluir os pais.
+_QUERY_JA_PROCESSADO = " ".join(
+    f"-label:{LABEL_TREE[k]['nome']}" for k in ("vagas_pai", "cert_pai", "alerta_pai", "geral_pai")
+)
 
 # Ordem de criação: pais antes dos filhos (obrigatório pela Gmail API)
 _LABEL_ORDEM = [
@@ -552,6 +561,32 @@ def extrair_corpo(payload: dict) -> str:
 def _header(headers: list, name: str, default: str = "") -> str:
     nl = name.lower()
     return next((h["value"] for h in headers if h["name"].lower() == nl), default)
+
+
+def _iterar_partes(payload: dict):
+    """Percorre recursivamente todas as partes MIME (multipart/mixed → alternative → ...)."""
+    for parte in payload.get("parts", []) or []:
+        yield parte
+        yield from _iterar_partes(parte)
+
+
+def _listar_mensagens(service, query: str, limite: int) -> list[dict]:
+    """
+    messages.list com paginação. A API devolve no máximo uma página por
+    chamada — sem seguir o nextPageToken, e-mails além da 1ª página eram
+    silenciosamente ignorados em janelas maiores (--dias 7, por exemplo).
+    """
+    msgs: list[dict] = []
+    token = None
+    while len(msgs) < limite:
+        resp = service.users().messages().list(
+            userId="me", q=query, maxResults=min(100, limite - len(msgs)), pageToken=token,
+        ).execute()
+        msgs.extend(resp.get("messages", []))
+        token = resp.get("nextPageToken")
+        if not token:
+            break
+    return msgs[:limite]
 
 
 def _detectar_fonte(remetente: str) -> str:
@@ -1043,7 +1078,10 @@ def classificar_email_pipeline(assunto: str, remetente: str, corpo_preview: str,
     if _tem_budget("geral"):
         resultado = _gs_classificar(assunto, remetente, corpo_preview)
         _consumir_budget("geral")
-        _cache_set("classif", msg_id, resultado)
+        # "outro" também é o retorno quando o gateway falha — não fica no
+        # cache para o e-mail ter outra chance na próxima execução.
+        if resultado != "outro":
+            _cache_set("classif", msg_id, resultado)
         return resultado
 
     return "outro"
@@ -1141,16 +1179,16 @@ def classificar_geral_pipeline(remetente: str, assunto: str, corpo: str,
 def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: bool):
     Log.section("Módulo 1 — Extração de Vagas")
 
+    # Pula e-mails que qualquer módulo já etiquetou — antes, todo e-mail da
+    # janela era relido (e salvo de novo no Supabase) a cada execução.
+    query = f"{query} {_QUERY_JA_PROCESSADO}"
     try:
-        listagem = service.users().messages().list(
-            userId="me", maxResults=50, q=query
-        ).execute()
-        msgs = listagem.get("messages", [])
+        msgs = _listar_mensagens(service, query, LIMITE_EMAILS)
     except HttpError as e:
         Log.error(f"Erro ao listar e-mails de vagas: {e}")
         return
 
-    Log.info(f"E-mails encontrados com a query '{query}': {len(msgs)}")
+    Log.info(f"E-mails novos na janela: {len(msgs)}")
 
     total_emails  = 0
     total_vagas   = 0
@@ -1408,8 +1446,7 @@ def rodar_certificados(service, drive_service, labels: dict, sb: Client | None,
     Log.info(f"Query: '{query}'")
 
     try:
-        res = service.users().messages().list(userId="me", q=query, maxResults=20).execute()
-        msgs = res.get("messages", [])
+        msgs = _listar_mensagens(service, query, LIMITE_EMAILS)
     except HttpError as e:
         Log.error(f"Erro ao listar e-mails de certificados: {e}")
         return
@@ -1429,7 +1466,10 @@ def rodar_certificados(service, drive_service, labels: dict, sb: Client | None,
         assunto  = _header(headers, "Subject", "Sem Assunto")
         Log.info(f"  Processando: {assunto[:60]}")
 
-        partes            = detalhe["payload"].get("parts", [])
+        # [FIX] Percorre partes aninhadas: a maioria dos e-mails com anexo é
+        # multipart/mixed → multipart/alternative → text/html, e antes só o
+        # 1º nível era lido (o HTML e o PDF ficavam invisíveis).
+        partes            = list(_iterar_partes(detalhe["payload"]))
         sucesso           = False
         drive_url         = None
         caminho_resultado = ""
@@ -1473,10 +1513,7 @@ def rodar_certificados(service, drive_service, labels: dict, sb: Client | None,
 
         # --- Parte B: links de rastreamento / portais ---
         if not sucesso:
-            html_body = ""
-            for parte in partes:
-                if parte.get("mimeType") == "text/html":
-                    html_body = _decode_b64(parte["body"].get("data", ""))
+            _, html_body = _extrair_corpo_e_html(detalhe["payload"])
 
             links = _extrair_links_certificado(html_body)  # lista de dicts
             for item in links:
@@ -1581,8 +1618,7 @@ def rodar_alertas(service, labels: dict, sb: Client | None, query_dias: int, dry
     Log.info(f"Query: '{query}'")
 
     try:
-        res = service.users().messages().list(userId="me", q=query, maxResults=10).execute()
-        msgs = res.get("messages", [])
+        msgs = _listar_mensagens(service, f"{query} -label:{LABEL_TREE['alerta_pai']['nome']}", LIMITE_EMAILS)
     except HttpError as e:
         Log.error(f"Erro ao listar e-mails de acesso: {e}")
         return
@@ -1721,25 +1757,13 @@ def rodar_emails_gerais(service, labels: dict, sb: Client | None, query: str, dr
     Log.section("Módulo 4 — E-mails Gerais")
 
     # Exclui e-mails já processados pelos outros módulos
-    q_final = (
-        f"{query} "
-        f"-label:AutoApply/Vagas/Alta_Prioridade "
-        f"-label:AutoApply/Vagas/Baixa_Prioridade "
-        f"-label:AutoApply/Certificados/Extraido "
-        f"-label:AutoApply/Certificados/Pendente "
-        f"-label:AutoApply/Alertas/OTP "
-        f"-label:AutoApply/Alertas/Recuperacao "
-        f"-label:AutoApply/Geral/Agendamento "
-        f"-label:AutoApply/Geral/Financeiro "
-        f"-label:AutoApply/Geral/Servicos"
-    )
+    # [FIX] A lista antiga esquecia Geral/Comunicado — comunicados eram
+    # reclassificados (e gastavam budget de IA) em toda execução.
+    q_final = f"{query} {_QUERY_JA_PROCESSADO}"
     Log.info(f"Query: '{q_final[:90]}...'")
 
     try:
-        listagem = service.users().messages().list(
-            userId="me", maxResults=80, q=q_final
-        ).execute()
-        msgs = listagem.get("messages", [])
+        msgs = _listar_mensagens(service, q_final, LIMITE_EMAILS)
     except HttpError as e:
         Log.error(f"Erro ao listar e-mails gerais: {e}")
         return
