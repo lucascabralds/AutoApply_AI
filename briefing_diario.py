@@ -23,8 +23,6 @@ import sys
 import json
 import argparse
 import datetime
-import smtplib
-import textwrap
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -34,12 +32,10 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Google / Gmail (para envio via API, sem SMTP)
 # ---------------------------------------------------------------------------
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import base64
+
+import google_auth
 
 # ---------------------------------------------------------------------------
 # Supabase
@@ -51,17 +47,6 @@ from supabase import create_client, Client
 # ---------------------------------------------------------------------------
 SUPABASE_URL   = (os.getenv("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_KEY   = os.getenv("SUPABASE_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-_BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
-TOKEN_PATH       = os.getenv("GMAIL_TOKEN_PATH",       os.path.join(_BASE_DIR, "token.json"))
-CREDENTIALS_PATH = os.getenv("GMAIL_CREDENTIALS_PATH", os.path.join(_BASE_DIR, "credentials.json"))
-
-SCOPES_SEND = [
-    "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.modify",
-]
 
 # Destinatário do briefing — padrão: próprio Gmail
 DESTINATARIO = os.getenv("BRIEFING_DESTINATARIO", "me")
@@ -82,30 +67,9 @@ ICONES = {
 # ===========================================================================
 
 def _autenticar_gmail():
-    if not os.path.exists(CREDENTIALS_PATH):
-        raise FileNotFoundError(
-            f"credentials.json não encontrado em: {CREDENTIALS_PATH}"
-        )
-    creds = None
-    if os.path.exists(TOKEN_PATH):
-        try:
-            creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES_SEND)
-        except Exception:
-            creds = None
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except Exception:
-                creds = None
-        if not creds:
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES_SEND)
-            creds = flow.run_local_server(port=0)
-        with open(TOKEN_PATH, "w") as f:
-            f.write(creds.to_json())
-
-    return build("gmail", "v1", credentials=creds)
+    """Usa o mesmo token/escopos do main.py (ver google_auth.py)."""
+    (service,) = google_auth.construir_servicos("gmail")
+    return service
 
 
 # ===========================================================================
