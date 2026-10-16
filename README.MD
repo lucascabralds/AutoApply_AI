@@ -43,6 +43,7 @@ O algoritmo monitora ativamente a conta do Gmail e realiza a extração e o proc
 | `google_auth.py` | OAuth2 único para todos os scripts (um só `token.json`, com todos os escopos). |
 | `gerar_dashboard.py` + `dashboard/template.html` | Dashboard HTML com os dados reais do Supabase (vagas por score, candidaturas, tecnologias, despesas, certificados). |
 | `agendador.py` | Roda alertas, pipeline e briefing em horários definidos (usado no Docker). |
+| `calendario.py` | Vencimentos e agendamentos → eventos no Google Calendar (com lembrete). |
 | `notificador.py` | Envio de mensagens pelo Telegram. |
 | `seguranca.py` | Redação de OTPs e links de recuperação antes de gravar/enviar. |
 | `candidatura.py` | Rascunhos de candidatura no Gmail: carta gerada pela IA a partir do perfil + currículo anexado. |
@@ -63,7 +64,7 @@ pip install -r requirements.txt
 ```
 
 ### 2. Google Cloud
-1. Crie um projeto no [Google Cloud Console](https://console.cloud.google.com/) e habilite **Gmail API** e **Google Drive API** (e **Google Tasks API**, se for usar os follow-ups).
+1. Crie um projeto no [Google Cloud Console](https://console.cloud.google.com/) e habilite **Gmail API** e **Google Drive API** (e **Google Tasks API** / **Google Calendar API**, se for usar follow-ups e eventos).
 2. Crie uma credencial OAuth do tipo *Desktop* e salve como `credentials.json` na raiz do projeto.
 3. Na primeira execução o navegador abre para autorizar. O `token.json` gerado é compartilhado por todos os scripts.
 
@@ -131,6 +132,7 @@ AutoApply/Geral/Agendamento          confirmações, reservas
 AutoApply/Geral/Financeiro           faturas, boletos, recibos
 AutoApply/Geral/Comunicado           avisos de empresas e bancos
 AutoApply/Geral/Servicos             demais notificações
+AutoApply/Geral/Veiculo              Detran, IPVA, licenciamento, multas, CNH
 ```
 
 ---
@@ -143,6 +145,7 @@ AutoApply/Geral/Servicos             demais notificações
 - [x] Follow-ups automáticos de vagas no Google Tasks
 - [x] Briefing diário por e-mail
 - [x] Testes automatizados + CI
+- [x] Monitoramento automotivo e vencimentos: Detran/IPVA/licenciamento/multas com label própria, gravados como despesa e, com o Calendar ligado, boletos e agendamentos viram eventos com lembrete
 - [x] Rascunhos de candidatura (Fase 3, com revisão humana): carta personalizada + currículo anexado, endereçada ao recrutador quando o e-mail aparece na vaga
 - [x] Dashboard com dados reais do Supabase (antes: protótipo com dados fictícios)
 - [x] Docker + agendador (alertas a cada minuto, pipeline a cada 30 min, briefing diário)
@@ -150,8 +153,7 @@ AutoApply/Geral/Servicos             demais notificações
 
 **Próximos passos**
 1. **Automação de Finanças:** cruzar `despesas_domesticas` com as planilhas financeiras existentes.
-2. **Monitoramento Automotivo e Burocrático:** Detran, IPVA, licenciamento → Google Calendar + Drive.
-3. **Envio automático opcional** dos rascunhos de candidatura, depois de algumas semanas validando a qualidade das cartas.
+2. **Envio automático opcional** dos rascunhos de candidatura, depois de algumas semanas validando a qualidade das cartas.
 
 ---
 

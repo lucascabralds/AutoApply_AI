@@ -37,6 +37,7 @@ from googleapiclient.errors import HttpError
 import base64
 
 import google_auth
+from formatacao import empresa_conhecida, formatar_reais
 from seguranca import redigir_segredo
 
 # ---------------------------------------------------------------------------
@@ -256,7 +257,7 @@ def _formatar_vagas(vagas: list[dict]) -> tuple[str, str]:
         for v in items[:5]:   # máx 5 por fonte no briefing (já vêm ordenadas por score)
             cargo = (v.get("cargo") or "Cargo não identificado")[:55]
             empresa = v.get("empresa")
-            if empresa and not empresa.lower().startswith("não identificada"):
+            if empresa_conhecida(empresa):
                 cargo = f"{cargo} @ {empresa[:30]}"
             score = v.get("score_match")
             flag = "" if score is None else ("🔥 " if score >= 75 else "⚡ " if score >= 50 else "")
@@ -284,17 +285,6 @@ def _formatar_vagas(vagas: list[dict]) -> tuple[str, str]:
     return "\n".join(txt_linhas) + "\n", "".join(html_linhas)
 
 
-def _formatar_reais(valor) -> str:
-    """49.9 → 'R$ 49,90'. Texto livre (registros antigos) é devolvido como veio."""
-    if valor in (None, ""):
-        return "—"
-    try:
-        n = float(valor)
-    except (TypeError, ValueError):
-        return str(valor)
-    return "R$ " + f"{n:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
-
 def _formatar_despesas(despesas: list[dict]) -> tuple[str, str]:
     if not despesas:
         return "  Nenhuma despesa registrada.\n", "<li>Nenhuma despesa registrada.</li>"
@@ -302,7 +292,7 @@ def _formatar_despesas(despesas: list[dict]) -> tuple[str, str]:
     html = []
     for d in despesas:
         est   = (d.get("estabelecimento") or "?")[:35]
-        val   = _formatar_reais(d.get("valor"))
+        val   = formatar_reais(d.get("valor"))
         dt    = d.get("data_despesa") or "—"
         cat   = d.get("categoria") or ""
         txt.append(f"  · {est:<35}  {val:<12}  venc. {dt}")

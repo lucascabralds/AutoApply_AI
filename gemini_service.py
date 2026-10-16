@@ -471,7 +471,7 @@ def classificar_email_geral(remetente: str, assunto: str, corpo: str) -> dict:
 
     Retorna:
     {
-      "categoria":       "agendamento | financeiro | comunicado | servicos | outro",
+      "categoria":       "agendamento | financeiro | veiculo | comunicado | servicos | outro",
       "resumo":          "1 frase",
       "remetente_nome":  str,
       "data_evento":     str | null,
@@ -484,10 +484,10 @@ def classificar_email_geral(remetente: str, assunto: str, corpo: str) -> dict:
 Você é um assistente pessoal que organiza e-mails.
 Analise o e-mail e responda APENAS em JSON estrito (sem crases):
 {{
-  "categoria": "agendamento | financeiro | comunicado | servicos | outro",
+  "categoria": "agendamento | financeiro | veiculo | comunicado | servicos | outro",
   "resumo": "1 frase curta sobre o que o e-mail diz",
   "remetente_nome": "nome amigável (ex: Barbearia Hermanos, Google Play)",
-  "data_evento": "data/hora do agendamento como string, ou null",
+  "data_evento": "data/hora do agendamento OU data de vencimento (DD/MM/AAAA, com HH:MM se houver), ou null",
   "valor": "valor monetário como string (ex: R$ 49,90), ou null",
   "link_principal": "URL mais importante do e-mail, ou null",
   "requer_acao": true/false
@@ -496,6 +496,7 @@ Analise o e-mail e responda APENAS em JSON estrito (sem crases):
 Categorias:
   agendamento — confirmação de horário, reserva, consulta
   financeiro  — fatura, boleto, cobrança, comprovante, nota fiscal
+  veiculo     — Detran, IPVA, licenciamento, multa de trânsito, CNH, seguro auto
   comunicado  — aviso de empresa/banco/serviço que você usa (mudança de
                 horário, termos, manutenção, alerta de segurança)
   servicos    — notificações de apps, boas-vindas, newsletters, promoções

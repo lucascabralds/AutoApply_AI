@@ -26,6 +26,8 @@ from email.message import EmailMessage
 
 from dotenv import load_dotenv
 
+from formatacao import empresa_conhecida
+
 load_dotenv()
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -91,8 +93,7 @@ def montar_mensagem(vaga: dict, carta: str, destinatario: str | None,
                     curriculo_pdf: str | None = None) -> EmailMessage:
     msg = EmailMessage()
     empresa = vaga.get("empresa")
-    empresa_ok = empresa and not empresa.lower().startswith("não identificada")
-    msg["Subject"] = f"Candidatura — {vaga.get('cargo')}" + (f" | {empresa}" if empresa_ok else "")
+    msg["Subject"] = f"Candidatura — {vaga.get('cargo')}" + (f" | {empresa}" if empresa_conhecida(empresa) else "")
     if destinatario:
         msg["To"] = destinatario
 

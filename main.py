@@ -61,8 +61,10 @@ from googleapiclient.http import MediaIoBaseUpload
 
 import google_auth
 from notificador import enviar_telegram, escapar_html, telegram_configurado
+from formatacao import empresa_conhecida, formatar_reais
 from seguranca import redigir_segredo
 from services.gmail.add_task import criar_tarefa_vaga
+import calendario
 import candidatura
 
 # ---------------------------------------------------------------------------
@@ -223,6 +225,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 #   AutoApply/Geral/Agendamento       confirmações de agendamento, reservas
 #   AutoApply/Geral/Financeiro        cobranças, faturas, recibos
 #   AutoApply/Geral/Servicos          assinaturas, apps, notificações diversas
+#   AutoApply/Geral/Veiculo           Detran, IPVA, licenciamento, multas, CNH
 #
 # Regra de isolamento: cada módulo chama _aplicar_labels() apenas com
 # as chaves do SEU domínio. Nenhum módulo toca em labels de outro.
@@ -249,6 +252,7 @@ LABEL_TREE = {
     "geral_financeiro":   {"nome": "AutoApply/Geral/Financeiro",         "cor_bg": "#666666", "cor_txt": "#ffffff"},
     "geral_comunicado":   {"nome": "AutoApply/Geral/Comunicado",         "cor_bg": "#4a86e8", "cor_txt": "#ffffff"},
     "geral_servicos":     {"nome": "AutoApply/Geral/Servicos",           "cor_bg": "#cccccc", "cor_txt": "#000000"},
+    "geral_veiculo":      {"nome": "AutoApply/Geral/Veiculo",            "cor_bg": "#ffad47", "cor_txt": "#000000"},
 }
 
 # Filtro de busca que exclui e-mails já etiquetados por qualquer módulo.
@@ -263,7 +267,7 @@ _LABEL_ORDEM = [
     "cert_pai",    "cert_extraido", "cert_pendente",
     "alerta_pai",  "alerta_otp",    "alerta_recuperacao",
     "geral_pai",   "geral_agendamento", "geral_financeiro",
-    "geral_comunicado", "geral_servicos",
+    "geral_comunicado", "geral_servicos", "geral_veiculo",
 ]
 
 # ---------------------------------------------------------------------------
@@ -964,10 +968,6 @@ def _status_do_email(tipo_email: str | None, status_candidatura: str | None) -> 
     return "nova"
 
 
-def _empresa_conhecida(empresa: str | None) -> bool:
-    return bool(empresa) and not empresa.lower().startswith("não identificada")
-
-
 def atualizar_status_vaga(sb: Client | None, vaga: dict, novo_status: str) -> bool:
     """
     E-mails de acompanhamento ("sua candidatura foi enviada", "você avançou
@@ -978,7 +978,7 @@ def atualizar_status_vaga(sb: Client | None, vaga: dict, novo_status: str) -> bo
     if not sb or _SCHEMA_VAGAS_V3 is False:
         return False
     empresa, cargo = vaga.get("empresa"), vaga.get("cargo") or ""
-    if not _empresa_conhecida(empresa):
+    if not empresa_conhecida(empresa):
         return False
     padrao = re.sub(r"[%_*,()]", " ", empresa).strip()
     try:
@@ -1072,8 +1072,8 @@ def salvar_email_geral(sb: Client | None, registro_raw: dict, dry_run: bool = Fa
 
     categoria = registro_raw.get("categoria", "servicos")
 
-    # ── Financeiro → despesas_domesticas ────────────────────────────────────
-    if categoria == "financeiro":
+    # ── Financeiro e veículo (IPVA, multa...) → despesas_domesticas ────────
+    if categoria in ("financeiro", "veiculo"):
         # Só inclui campos que têm valor — evita NOT NULL violation
         # O schema tem: gmail_message_id, estabelecimento, categoria,
         #               valor (nullable), data_despesa (nullable), origem_recurso
@@ -1084,7 +1084,7 @@ def salvar_email_geral(sb: Client | None, registro_raw: dict, dry_run: bool = Fa
                 or registro_raw.get("remetente", "").split("<")[0].strip()
                 or "Desconhecido"
             ),
-            "categoria":        registro_raw.get("subcategoria", "boleto_fatura"),
+            "categoria":        registro_raw.get("subcategoria") or "boleto_fatura",
             "origem_recurso":   "email",
         }
         # Só adiciona valor se for um número reconhecível ("R$ 1.234,56" → 1234.56)
@@ -1477,20 +1477,24 @@ def preparar_rascunho_candidatura(service, vaga: dict, texto_email: str) -> str 
     return rascunho_id
 
 
-def _uma_vez(acao: str, vaga: dict, executar) -> None:
+def _uma_vez_chave(acao: str, chave: str, executar) -> None:
     """
-    Executa um efeito colateral (push, tarefa, rascunho) no máximo uma vez
-    por vaga — marcado no cache — e sem deixar uma exceção interromper o
+    Executa um efeito colateral (push, tarefa, evento...) no máximo uma vez
+    por chave — marcado no cache — e sem deixar uma exceção interromper o
     resto do processamento do e-mail (que ainda precisa receber a label).
     """
-    uid = _vaga_uid(vaga.get("email_id"), vaga.get("cargo"), vaga.get("empresa"))
-    if _cache_get(acao, uid, str):
+    if _cache_get(acao, chave, str):
         return
     try:
         if executar():
-            _cache_set(acao, uid, "ok")
+            _cache_set(acao, chave, "ok")
     except Exception as e:
-        Log.warn(f"  {acao} falhou para '{vaga.get('cargo')}': {e}")
+        Log.warn(f"  {acao} falhou ({chave}): {e}")
+
+
+def _uma_vez(acao: str, vaga: dict, executar) -> None:
+    """_uma_vez_chave() para efeitos de uma vaga específica."""
+    _uma_vez_chave(acao, _vaga_uid(vaga.get("email_id"), vaga.get("cargo"), vaga.get("empresa")), executar)
 
 
 def acoes_vaga_prioritaria(service, tasks_service, vaga: dict, texto_recrutador: str) -> None:
@@ -2062,6 +2066,13 @@ def rodar_alertas(service, labels: dict, sb: Client | None, query_dias: int, dry
 
 # Palavras-chave para classificar e-mails gerais por categoria
 _PADROES_GERAL = {
+    "veiculo": [
+        "detran", "ipva", "licenciamento", "crlv", "renavam", "dpvat",
+        "multa de trânsito", "multa de transito", "auto de infração", "auto de infracao",
+        "notificação de autuação", "notificacao de autuacao", "infração de trânsito",
+        "carteira nacional de habilitação", "renovação da cnh", "renovacao da cnh",
+        "seguro auto", "vistoria veicular", "semparar", "conectcar", "veloe",
+    ],
     "agendamento": [
         "agendamento", "agendado", "confirmado", "reserva", "confirma sua visita",
         "confirmação de agendamento", "booksy", "scheduling", "appointment",
@@ -2094,6 +2105,15 @@ _PADROES_GERAL = {
 }
 
 # Subcategorias para financeiro (usadas no campo categoria do Supabase)
+_SUBCATEGORIA_VEICULO = {
+    "veiculo_ipva":          ["ipva"],
+    "veiculo_licenciamento": ["licenciamento", "crlv", "dpvat"],
+    "veiculo_multa":         ["multa", "infração", "infracao", "autuação", "autuacao"],
+    "veiculo_cnh":           ["cnh", "habilitação", "habilitacao"],
+    "veiculo_seguro":        ["seguro"],
+    "veiculo_pedagio":       ["semparar", "conectcar", "veloe", "pedágio", "pedagio"],
+}
+
 _SUBCATEGORIA_FINANCEIRO = {
     "boleto_fatura": ["boleto", "fatura", "vence", "vencimento", "valor a pagar", "emitido por"],
     "pix":           ["pix", "transferência", "ted", "doc"],
@@ -2102,6 +2122,14 @@ _SUBCATEGORIA_FINANCEIRO = {
     "cobranca":      ["cobrança", "debito", "crédito"],
 }
 
+def _detectar_subcategoria_veiculo(texto: str) -> str:
+    txt = texto.lower()
+    for sub, palavras in _SUBCATEGORIA_VEICULO.items():
+        if any(p in txt for p in palavras):
+            return sub
+    return "veiculo_outros"
+
+
 def _detectar_subcategoria_financeiro(texto: str) -> str:
     txt = texto.lower()
     for sub, palavras in _SUBCATEGORIA_FINANCEIRO.items():
@@ -2109,7 +2137,7 @@ def _detectar_subcategoria_financeiro(texto: str) -> str:
             return sub
     return "boleto_fatura"
 
-_CATEGORIAS_GERAIS = {"agendamento", "financeiro", "comunicado", "servicos"}
+_CATEGORIAS_GERAIS = {"agendamento", "financeiro", "comunicado", "servicos", "veiculo"}
 
 
 def _normalizar_categoria_geral(categoria_ia: str | None, categoria_heuristica: str) -> str:
@@ -2133,7 +2161,22 @@ def _categoria_heuristica(assunto: str, corpo: str) -> str:
     return "servicos"   # fallback
 
 
-def rodar_emails_gerais(service, labels: dict, sb: Client | None, query: str, dry_run: bool):
+def agendar_no_calendario(calendar_service, msg_id: str, registro: dict) -> None:
+    """Vencimento/agendamento com data futura → evento no Google Calendar (uma vez por e-mail)."""
+    evento = calendario.evento_do_registro(registro)
+    if not evento:
+        return
+
+    def _criar():
+        if calendario.criar_evento(calendar_service, evento):
+            Log.ok(f"      🗓  Evento no Calendar: {evento['summary']}")
+            return True
+
+    _uma_vez_chave("evento", msg_id, _criar)
+
+
+def rodar_emails_gerais(service, labels: dict, sb: Client | None, query: str, dry_run: bool,
+                        calendar_service=None):
     """
     Processa e-mails que não são vagas, certificados ou alertas.
     Usa heurística rápida para economizar tokens; chama Gemini apenas para
@@ -2189,31 +2232,33 @@ def rodar_emails_gerais(service, labels: dict, sb: Client | None, query: str, dr
         # 1. Classificação heurística (rápida, sem token)
         categoria = _categoria_heuristica(assunto, corpo)
 
-        # Detecta subcategoria para financeiro (ex: boleto_fatura, assinatura, pix)
-        subcategoria = (
-            _detectar_subcategoria_financeiro(assunto + " " + corpo[:200])
-            if categoria == "financeiro" else None
-        )
-
-        # 2. Para agendamentos/financeiros/comunicados vale gastar 1 token Gemini
+        # 2. Para agendamentos/financeiros/veículo/comunicados vale gastar 1 chamada de IA
         analise = {}
-        if _tem_budget("geral") and categoria in ("agendamento", "financeiro", "comunicado"):
+        if _tem_budget("geral") and categoria in ("agendamento", "financeiro", "veiculo", "comunicado"):
             try:
                 analise = classificar_geral_pipeline(remetente, assunto, corpo, msg["id"])
-                categoria = _normalizar_categoria_geral(analise.get("categoria"), categoria)
-                # Sobrescreve subcategoria se a IA identificou melhor
-                if analise.get("subcategoria"):
-                    subcategoria = analise["subcategoria"]
-                elif categoria == "financeiro" and not subcategoria:
-                    subcategoria = _detectar_subcategoria_financeiro(assunto + " " + corpo[:200])
+                # A heurística de veículo é bem específica (Detran, IPVA...) —
+                # a IA tende a chamar isso só de "financeiro"; mantém veículo.
+                if categoria != "veiculo":
+                    categoria = _normalizar_categoria_geral(analise.get("categoria"), categoria)
             except Exception as e:
                 Log.warn(f"  Gemini geral falhou: {e}")
+
+        # Subcategoria (ex.: boleto_fatura, pix, veiculo_ipva) — depois da IA,
+        # que pode ter mudado a categoria
+        texto_sub = assunto + " " + corpo[:300]
+        subcategoria = (
+            _detectar_subcategoria_veiculo(texto_sub) if categoria == "veiculo"
+            else _detectar_subcategoria_financeiro(texto_sub) if categoria == "financeiro"
+            else None
+        )
 
         resumo = (
             analise.get("resumo")
             or assunto[:80]
         )
 
+        valor_num = _parsear_valor(analise.get("valor"))
         registro = {
             "email_id":       msg["id"],
             "assunto":        assunto,
@@ -2225,6 +2270,7 @@ def rodar_emails_gerais(service, labels: dict, sb: Client | None, query: str, dr
             "resumo":         resumo,
             "data_evento":    analise.get("data_evento"),
             "valor":          analise.get("valor"),
+            "valor_formatado": formatar_reais(valor_num) if valor_num is not None else None,
             "link_principal": analise.get("link_principal") or _extrair_link_candidatura(corpo),
             "requer_acao":    bool(analise.get("requer_acao", False)),
             "status":         "novo",
@@ -2238,6 +2284,7 @@ def rodar_emails_gerais(service, labels: dict, sb: Client | None, query: str, dr
             "agendamento": "geral_agendamento",
             "financeiro":  "geral_financeiro",
             "comunicado":  "geral_comunicado",
+            "veiculo":     "geral_veiculo",
         }.get(categoria, "geral_servicos")
 
         _aplicar_label(
@@ -2248,8 +2295,12 @@ def rodar_emails_gerais(service, labels: dict, sb: Client | None, query: str, dr
         # ────────────────────────────────────────────────────────────────────
 
         total += 1
-        icone = {"agendamento": "📅", "financeiro": "💰", "comunicado": "📢", "servicos": "🔔"}.get(categoria, "📧")
+        icone = {"agendamento": "📅", "financeiro": "💰", "comunicado": "📢", "servicos": "🔔",
+                 "veiculo": "🚗"}.get(categoria, "📧")
         Log.ok(f"  {icone} [{categoria}] {remetente.split('<')[0].strip()[:30]} — {resumo[:50]}")
+
+        if calendar_service and not dry_run:
+            agendar_no_calendario(calendar_service, msg["id"], registro)
 
     Log.ok(f"E-mails gerais: {total} processados | {salvas} salvos no Supabase")
 
@@ -2326,6 +2377,7 @@ def main():
     labels = garantir_labels(service)
     sb = None if args.dry_run else criar_supabase()
     tasks_service = google_auth.construir_servicos("tasks")[0] if google_auth.TASKS_ENABLED else None
+    calendar_service = google_auth.construir_servicos("calendar")[0] if google_auth.CALENDAR_ENABLED else None
 
     rodar_todos = args.modulo == "todos"
 
@@ -2344,7 +2396,7 @@ def main():
             modulos_rodados.append("alertas")
 
         if rodar_todos or args.modulo == "geral":
-            rodar_emails_gerais(service, labels, sb, query, args.dry_run)
+            rodar_emails_gerais(service, labels, sb, query, args.dry_run, calendar_service)
             modulos_rodados.append("geral")
         return modulos_rodados
 

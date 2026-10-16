@@ -1,10 +1,11 @@
 import briefing_diario as b
+from formatacao import formatar_reais
 
 
 def test_formatar_reais():
-    assert b._formatar_reais(1234.5) == "R$ 1.234,50"
-    assert b._formatar_reais(None) == "—"
-    assert b._formatar_reais("R$ 10,00") == "R$ 10,00"
+    assert formatar_reais(1234.5) == "R$ 1.234,50"
+    assert formatar_reais(None) == "—"
+    assert formatar_reais("R$ 10,00") == "R$ 10,00"
 
 
 def test_vagas_mostram_empresa_score_e_escapam_html():

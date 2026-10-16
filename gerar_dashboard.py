@@ -25,7 +25,8 @@ import webbrowser
 
 from dotenv import load_dotenv
 
-from briefing_diario import _formatar_reais, coletar_vagas
+from briefing_diario import coletar_vagas
+from formatacao import empresa_conhecida, formatar_reais
 
 load_dotenv()
 
@@ -103,7 +104,7 @@ def montar_dados(brutos: dict, dias: int, agora: datetime.datetime | None = None
     for v in brutos.get("vagas", []):
         links = _lista_json(v.get("links_candidatura"))
         empresa = v.get("empresa")
-        if empresa and empresa.lower().startswith("não identificada"):
+        if not empresa_conhecida(empresa):
             empresa = None
         vagas.append({
             "cargo":   v.get("cargo") or "Cargo não identificado",
@@ -145,7 +146,7 @@ def montar_dados(brutos: dict, dias: int, agora: datetime.datetime | None = None
             "candidaturas":   sum(1 for v in vagas if v["status"] != "nova"),
             "em_processo":    sum(1 for v in vagas if v["status"] == "em_processo"),
             "despesas":       len(brutos.get("despesas", [])),
-            "despesas_total": _formatar_reais(sum(valores)) if valores else "—",
+            "despesas_total": formatar_reais(sum(valores)) if valores else "—",
         },
         "por_fonte": [{"fonte": f, "n": n} for f, n in fontes.most_common()],
         "top_techs": [{"tech": t, "n": n} for t, n in techs.most_common(10)],
@@ -158,7 +159,7 @@ def montar_dados(brutos: dict, dias: int, agora: datetime.datetime | None = None
         ],
         "despesas": [
             {"estabelecimento": d.get("estabelecimento") or "?", "categoria": d.get("categoria") or "",
-             "vencimento": d.get("data_despesa"), "valor": _formatar_reais(d.get("valor"))}
+             "vencimento": d.get("data_despesa"), "valor": formatar_reais(d.get("valor"))}
             for d in brutos.get("despesas", [])
         ],
         "certificados": [

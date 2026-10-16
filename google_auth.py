@@ -17,6 +17,8 @@ Configuração (.env):
   GMAIL_TOKEN_PATH        — caminho do token.json      (padrão: raiz do projeto)
   GOOGLE_TASKS_ENABLED    — "true" para incluir o escopo do Google Tasks
                             (follow-ups automáticos de vagas)
+  GOOGLE_CALENDAR_ENABLED — "true" para incluir o escopo do Google Calendar
+                            (vencimentos e agendamentos viram eventos)
   AUTOAPPLY_HEADLESS      — "true" em servidor/Docker: nunca tenta abrir o
                             navegador; falha com instrução clara se o token
                             não servir
@@ -41,6 +43,7 @@ TOKEN_PATH       = os.getenv("GMAIL_TOKEN_PATH",       os.path.join(_BASE_DIR, "
 CREDENTIALS_PATH = os.getenv("GMAIL_CREDENTIALS_PATH", os.path.join(_BASE_DIR, "credentials.json"))
 
 HEADLESS      = os.getenv("AUTOAPPLY_HEADLESS", "false").strip().lower() in ("1", "true", "sim", "yes")
+CALENDAR_ENABLED = os.getenv("GOOGLE_CALENDAR_ENABLED", "false").strip().lower() in ("1", "true", "sim", "yes")
 TASKS_ENABLED = os.getenv("GOOGLE_TASKS_ENABLED", "false").strip().lower() in ("1", "true", "sim", "yes")
 
 # gmail.modify cobre leitura, labels E envio (messages.send) — não é preciso
@@ -51,6 +54,8 @@ SCOPES = [
 ]
 if TASKS_ENABLED:
     SCOPES.append("https://www.googleapis.com/auth/tasks")
+if CALENDAR_ENABLED:
+    SCOPES.append("https://www.googleapis.com/auth/calendar.events")
 
 
 def _escopos_do_token(path: str) -> set:
@@ -120,7 +125,7 @@ def construir_servicos(*apis: str, log=print) -> tuple:
     Constrói os clientes pedidos, ex.: construir_servicos("gmail", "drive").
     Retorna uma tupla na mesma ordem.
     """
-    versoes = {"gmail": "v1", "drive": "v3", "tasks": "v1"}
+    versoes = {"gmail": "v1", "drive": "v3", "tasks": "v1", "calendar": "v3"}
     creds = obter_credenciais(log=log)
     return tuple(build(api, versoes[api], credentials=creds) for api in apis)
 
