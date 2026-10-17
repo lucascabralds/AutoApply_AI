@@ -1386,7 +1386,7 @@ def classificar_email_pipeline(assunto: str, remetente: str, corpo_preview: str,
     if any(p in txt for p in PALAVRAS_NAO_VAGA):
         if any(w in txt for w in _PALAVRAS_AGENDAMENTO):
             return "agendamento"
-        if any(w in txt for w in _PALAVRAS_FINANCEIRO):
+        if any(w in txt for w in _PALAVRAS_FINANCEIRO) and not _eh_promocao(txt):
             return "financeiro"
         return "servico"
 
@@ -1397,7 +1397,7 @@ def classificar_email_pipeline(assunto: str, remetente: str, corpo_preview: str,
     if any(w in txt for w in _PALAVRAS_AGENDAMENTO):
         return "agendamento"
     if any(w in txt for w in _PALAVRAS_FINANCEIRO):
-        return "financeiro"
+        return "servico" if _eh_promocao(txt) else "financeiro"
 
     if not _tem_budget("geral"):
         return "outro"
@@ -2273,6 +2273,34 @@ _SUBCATEGORIA_FINANCEIRO = {
     "cobranca":      ["cobrança", "cobranca", "débito", "debito", "crédito", "pendente"],
 }
 
+# Marketing com preço/Pix/crédito no texto (KaBuM, "Acompanhe seu Score"...)
+# casava "pix", "crédito", "pagamento" e caía em financeiro — gastando IA e,
+# se a IA achasse um preço, virando "despesa". Promoção só deixa de ser
+# promoção quando há sinal forte de transação real (fatura, vencimento,
+# comprovante, pedido confirmado...). "boleto"/"pix" sozinhos não contam:
+# toda promoção diz "pague no boleto ou no Pix".
+_PADROES_PROMOCAO = re.compile(
+    r"\d+\s?%\s?(?:off|de desconto)"
+    r"|(?<!\w)(?:descontos?|ofertas?|promo[cç](?:[aã]o|[oõ]es)|cupom|cupons|frete gr[aá]tis"
+    r"|black friday|cyber monday|aproveite|imperd[ií]ve(?:l|is)|liquida[cç][aã]o|s[oó] hoje"
+    r"|[uú]ltimas unidades|acompanhe seu score|seu score|cashback|sale)(?!\w)",
+    re.IGNORECASE,
+)
+_PADROES_TRANSACAO = re.compile(
+    r"(?<!\w)(?:seu boleto|sua fatura|fatura (?:fechou|fechada|dispon[ií]vel|do cart[aã]o)|vencimento|vence (?:hoje|amanh[aã]|em)"
+    r"|nota fiscal|nf-?e|comprovante|recibo|valor a pagar|d[eé]bito autom[aá]tico"
+    r"|pagamento (?:confirmado|aprovado|recebido|realizado|pendente)"
+    r"|pedido (?:confirmado|aprovado|realizado|recebido|n[ºo°.]?\s?\d)"
+    r"|compra (?:aprovada|confirmada|realizada))(?!\w)",
+    re.IGNORECASE,
+)
+
+
+def _eh_promocao(texto: str) -> bool:
+    """True para e-mail de marketing sem sinal de transação real."""
+    return bool(_PADROES_PROMOCAO.search(texto or "")) and not _PADROES_TRANSACAO.search(texto or "")
+
+
 def _contem_termo(texto: str, termos: list[str]) -> bool:
     """Casa termos como palavra inteira — "doc" não pode casar com "documento", nem "ted" com "conectado"."""
     return any(re.search(r"(?<!\w)" + re.escape(t) + r"(?!\w)", texto) for t in termos)
@@ -2323,7 +2351,8 @@ def _categoria_heuristica(assunto: str, corpo: str) -> str:
         return "veiculo"
     for cat, padroes in _PADROES_GERAL.items():
         if any(p in txt for p in padroes):
-            return cat
+            # Promoção não é despesa: vira "servicos" e nem gasta IA
+            return "servicos" if cat == "financeiro" and _eh_promocao(txt) else cat
     return "servicos"   # fallback
 
 
@@ -2412,6 +2441,9 @@ def rodar_emails_gerais(service, labels: dict, sb: Client | None, query: str, dr
                 # IA tende a chamar isso só de "financeiro" — mantém veículo,
                 # exceto quando é um agendamento (vistoria, exame da CNH).
                 categoria_ia = _normalizar_categoria_geral(analise.get("categoria"), categoria)
+                # A IA também vê o preço da promoção e chama de "financeiro"
+                if categoria_ia == "financeiro" and _eh_promocao((assunto + " " + corpo[:300]).lower()):
+                    categoria_ia = "servicos"
                 if categoria != "veiculo" or categoria_ia == "agendamento":
                     categoria = categoria_ia
             except Exception as e:

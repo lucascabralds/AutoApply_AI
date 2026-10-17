@@ -135,3 +135,36 @@ def test_falha_permanente_da_ia_cai_na_heuristica_depois_de_n_tentativas(ambient
         assert "f1" not in gmail.labels_aplicadas      # ainda tentando
     main.rodar_emails_gerais(gmail, labels, _FakeSB(), "q", dry_run=False)
     assert gmail.labels_aplicadas["f1"] == ["G", "G_FIN"]   # desistiu da IA, salvou pela heurística
+
+
+@pytest.mark.parametrize("assunto, corpo, esperado", [
+    ("Ofertas imperdíveis: RTX 4060 com 20% OFF", "Pague no Pix com desconto ou no boleto", "servicos"),
+    ("Lucas, acompanhe seu Score", "Seu score de crédito mudou. Confira", "servicos"),
+    ("Black Friday KaBuM!", "Parcele no crédito em até 10x", "servicos"),
+    # transação real continua financeiro, mesmo com palavra de marketing
+    ("Sua fatura fechou", "Valor a pagar R$ 250,00. Aproveite o cashback", "financeiro"),
+    ("KaBuM: compra aprovada", "Pagamento aprovado no Pix com 10% de desconto", "financeiro"),
+    ("Seu boleto Vivo chegou", "Vencimento em 29/10", "financeiro"),
+])
+def test_promocao_nao_vira_financeiro(assunto, corpo, esperado):
+    assert main._categoria_heuristica(assunto, corpo) == esperado
+
+
+def test_promocao_nao_vira_despesa_mesmo_se_a_ia_disser_financeiro(ambiente, monkeypatch):
+    gmail, _ = ambiente
+    gmail.mensagens = {"p1": _msg("Aviso importante: só hoje 30% OFF", "Loja <ofertas@loja.com>",
+                                  "Informamos que a promoção acaba hoje. Notebook por R$ 1.999,00")}
+    monkeypatch.setattr(main, "_gs_classificar_geral", lambda *a: {"categoria": "financeiro", "valor": "R$ 1.999,00"})
+    assert main._categoria_heuristica("Aviso importante: só hoje 30% OFF", "") == "comunicado"  # vai para a IA
+    sb = _FakeSB()
+    main.rodar_emails_gerais(gmail, {"geral_pai": "G", "geral_servicos": "G_SRV", "geral_financeiro": "G_FIN"},
+                             sb, "q", dry_run=False)
+    assert gmail.labels_aplicadas["p1"] == ["G", "G_SRV"]
+    assert not [r for t, r in sb.gravados if t == "despesas_domesticas"]
+
+
+def test_classificacao_do_modulo_de_vagas_tambem_ignora_promocao(monkeypatch):
+    monkeypatch.setattr(main, "_GEMINI_CACHE", {})
+    cat = main.classificar_email_pipeline("Promoção: crédito pré-aprovado com desconto", "loja@x.com",
+                                          "pagamento no pix", "z1")
+    assert cat == "servico"
