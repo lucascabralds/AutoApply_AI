@@ -37,7 +37,7 @@ O algoritmo monitora ativamente a conta do Gmail e realiza a extração e o proc
 | Arquivo | Papel |
 |---|---|
 | `main.py` | Orquestrador: vagas → certificados → alertas → e-mails gerais, com labels no Gmail e gravação no Supabase. |
-| `briefing_diario.py` | Briefing matinal: resume as últimas 24h (vagas por score, despesas, agendamentos, alertas) e envia para o seu Gmail. |
+| `briefing_diario.py` | Briefing matinal: abre com **"Aplicar hoje"** (as melhores vagas ainda não aplicadas, com o porquê do score) e o **funil de candidaturas** (nova → aplicada → em processo → resultado, e candidaturas sem retorno), depois resume as últimas 24h (vagas, despesas, agendamentos, alertas) e envia para o seu Gmail. |
 | `gemini_service.py` | Prompts e parse robusto do JSON da IA (cercas de markdown, vírgulas soltas, respostas truncadas). |
 | `rota_ia_client.py` | Cliente HTTP do gateway Rota.IA com retry em 429/503. |
 | `google_auth.py` | OAuth2 único para todos os scripts (um só `token.json`, com todos os escopos). |
