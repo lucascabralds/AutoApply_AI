@@ -1094,10 +1094,15 @@ def salvar_email_geral(sb: Client | None, registro_raw: dict, dry_run: bool = Fa
             "categoria":        registro_raw.get("subcategoria") or "boleto_fatura",
             "origem_recurso":   "email",
         }
-        # Só adiciona valor se for um número reconhecível ("R$ 1.234,56" → 1234.56)
+        # Sem valor reconhecível ("R$ 1.234,56" → 1234.56) não é uma despesa
+        # útil — e a coluna valor pode ser NOT NULL no banco. Ex. real: "Acompanhe
+        # seu Score" e promoções caíam aqui e quebravam o insert com 23502.
+        # O e-mail continua recebendo a label Financeiro/Veículo normalmente.
         valor = _parsear_valor(registro_raw.get("valor"))
-        if valor is not None:
-            registro["valor"] = valor
+        if valor is None:
+            Log.info(f"  (sem valor — não vai para despesas): {registro_raw.get('assunto','')[:50]}")
+            return True
+        registro["valor"] = valor
 
         # Só adiciona data_despesa se não for None/vazio
         data_raw = registro_raw.get("data_evento") or registro_raw.get("data_despesa")

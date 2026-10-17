@@ -109,3 +109,18 @@ def test_parsear_valor_prefere_o_numero_da_moeda(entrada, esperado):
 ])
 def test_erro_de_schema_so_para_migracao_ausente(mensagem, eh_schema):
     assert main._erro_de_schema(Exception(mensagem)) is eh_schema
+
+
+def test_despesa_sem_valor_nao_e_gravada():
+    sb = _FakeSupabase()
+    ok = main.salvar_email_geral(sb, {"email_id": "s1", "categoria": "financeiro", "assunto": "Acompanhe seu Score",
+                                      "remetente_nome": "Consumidor Positivo", "valor": None})
+    assert ok and sb.gravados == []
+
+
+def test_despesa_com_valor_e_gravada():
+    sb = _FakeSupabase()
+    main.salvar_email_geral(sb, {"email_id": "s2", "categoria": "financeiro", "subcategoria": "boleto_fatura",
+                                 "remetente_nome": "Vivo", "valor": "R$ 99,90", "data_evento": "29/10/2026"})
+    tabela, _, registro, _ = sb.gravados[0]
+    assert tabela == "despesas_domesticas" and registro["valor"] == 99.90 and registro["data_despesa"] == "2026-10-29"

@@ -74,3 +74,7 @@ create table if not exists despesas_domesticas (
     origem_recurso   text default 'email',
     created_at       timestamptz not null default now()
 );
+
+-- Tabelas criadas antes deste schema podem ter data_despesa obrigatória; o
+-- pipeline grava despesas com valor mesmo quando o e-mail não traz a data.
+alter table despesas_domesticas alter column data_despesa drop not null;
