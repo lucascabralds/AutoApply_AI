@@ -53,7 +53,28 @@ def test_vaga_uid_estavel_e_distinto_por_vaga():
     a = main._vaga_uid("msg1", "Desenvolvedor Python", "ACME")
     assert a == main._vaga_uid("msg1", "desenvolvedor  python!", "acme")
     assert a != main._vaga_uid("msg1", "Analista de Dados", "ACME")
-    assert a != main._vaga_uid("msg2", "Desenvolvedor Python", "ACME")
+    # a mesma vaga vinda em outro e-mail (digest repetido, outra plataforma) é a mesma vaga
+    assert a == main._vaga_uid("msg2", "Desenvolvedor Python", "ACME")
+
+
+def test_vaga_uid_sem_empresa_usa_link_canonico_ou_o_email():
+    link1 = "https://www.catho.com.br/vagas/analista-de-sistemas/123/?utm_source=email&origem=alerta#topo"
+    link2 = "https://catho.com.br/vagas/analista-de-sistemas/123?utm_source=outro"
+    a = main._vaga_uid("m1", "Analista de sistemas", "Não identificada", link1)
+    assert a == main._vaga_uid("m2", "Analista de sistemas", None, link2)
+    # sem link próprio não dá para saber se é a mesma vaga
+    assert main._vaga_uid("m1", "Analista", None) != main._vaga_uid("m2", "Analista", None)
+    # o identificador da vaga no Indeed (?jk=) não é rastreio
+    assert main._canonizar_link("https://br.indeed.com/viewjob?jk=1&from=ja") != \
+        main._canonizar_link("https://br.indeed.com/viewjob?jk=2&from=ja")
+
+
+def test_vaga_repetida_nao_volta_para_nova():
+    sb = _FakeSupabase()
+    main.salvar_vaga(sb, _vaga("Dev Python"))
+    assert "status_aplicacao" not in sb.gravados[-1][2]   # default da coluna no insert; intocado no update
+    main.salvar_vaga(sb, {**_vaga("Dev Python"), "status": "aplicada"})
+    assert sb.gravados[-1][2]["status_aplicacao"] == "aplicada"
 
 
 def test_digest_com_varias_vagas_gera_uma_linha_por_vaga():

@@ -877,14 +877,57 @@ def _sb_upsert_insert(sb: Client, tabela: str, registro: dict, conflict_col: str
         return False
 
 
-def _vaga_uid(email_id: str, cargo: str | None, empresa: str | None) -> str:
+# Parâmetros de rastreio que mudam a cada e-mail sem mudar a vaga
+_PARAMS_RASTREIO = re.compile(
+    r"^(utm_\w+|origem|origin|src|source|ref|refid|referrer|trk|trackingid|tracking_id|"
+    r"mid|eid|cid|campaign|campanha|fbclid|gclid|from|alertid|alert_id|lipi|midtoken|midsig|"
+    r"position|pagenum|sid|token|hash)$",
+    re.IGNORECASE,
+)
+
+
+def _canonizar_link(url: str | None) -> str:
     """
-    Identificador estável de UMA vaga: mesmo e-mail + mesmo cargo + mesma
-    empresa → mesmo uid. Permite upsert por vaga (um digest com 10 vagas
-    vira 10 linhas) sem duplicar quando o e-mail é processado de novo.
+    Link da vaga sem o que varia entre e-mails (utm_*, trackingId, fragmento,
+    barra final) — o mesmo anúncio vindo em dois digests vira o mesmo texto.
+    Parâmetros que identificam a vaga (ex.: ?jk= do Indeed) são mantidos.
     """
-    chave = "|".join([email_id or "", _normalizar_para_match(cargo or ""), _normalizar_para_match(empresa or "")])
+    if not url:
+        return ""
+    try:
+        p = urllib.parse.urlsplit(url.strip())
+    except ValueError:
+        return url.strip()
+    query = [(k, v) for k, v in urllib.parse.parse_qsl(p.query, keep_blank_values=True)
+             if not _PARAMS_RASTREIO.match(k)]
+    host = p.netloc.lower().removeprefix("www.")
+    return urllib.parse.urlunsplit(("https", host, p.path.rstrip("/"), urllib.parse.urlencode(sorted(query)), ""))
+
+
+def _vaga_uid(email_id: str, cargo: str | None, empresa: str | None, link: str | None = None) -> str:
+    """
+    Identificador estável de UMA vaga, independente do e-mail em que veio:
+      - empresa conhecida → cargo + empresa (o mesmo anúncio chega em vários
+        digests, e o mesmo digest às vezes chega 2x);
+      - empresa desconhecida, mas link próprio da vaga → cargo + link canônico;
+      - senão → e-mail + cargo (sem como saber se é a mesma vaga).
+    Permite upsert por vaga (um digest com 10 vagas vira 10 linhas) sem
+    duplicar a vaga quando ela reaparece.
+    """
+    cargo_n = _normalizar_para_match(cargo or "")
+    if empresa_conhecida(empresa):
+        chave = "|".join(["vaga", cargo_n, _normalizar_para_match(empresa)])
+    elif link:
+        chave = "|".join(["link", cargo_n, _canonizar_link(link)])
+    else:
+        chave = "|".join([email_id or "", cargo_n, _normalizar_para_match(empresa or "")])
     return hashlib.sha1(chave.encode("utf-8")).hexdigest()[:20]
+
+
+def _uid_da_vaga(vaga: dict) -> str:
+    """_vaga_uid() de um dict de vaga do pipeline (link só se for o link próprio da vaga)."""
+    link = vaga.get("link_candidatura") if vaga.get("link_especifico") else None
+    return _vaga_uid(vaga.get("email_id"), vaga.get("cargo"), vaga.get("empresa"), link)
 
 
 # None = ainda não testado nesta execução; False = banco sem a migração v3
@@ -920,7 +963,7 @@ def salvar_vaga(sb: Client | None, vaga: dict, dry_run: bool = False) -> bool:
 
     if _SCHEMA_VAGAS_V3 is not False:
         registro = {
-            "vaga_uid":          _vaga_uid(vaga.get("email_id"), vaga.get("cargo"), vaga.get("empresa")),
+            "vaga_uid":          _uid_da_vaga(vaga),
             "gmail_message_id":  vaga.get("email_id"),
             "cargo":             vaga.get("cargo"),
             "empresa":           vaga.get("empresa"),
@@ -934,8 +977,11 @@ def salvar_vaga(sb: Client | None, vaga: dict, dry_run: bool = False) -> bool:
             "links_candidatura": links,
             "tipo_email":        vaga.get("tipo_email"),
             "data_email":        vaga.get("data_email"),
-            "status_aplicacao":  vaga.get("status", "nova"),
         }
+        # "nova" é o default da coluna: não mandar evita que a mesma vaga,
+        # reaparecendo num digest, volte de "aplicada" para "nova" no upsert.
+        if vaga.get("status", "nova") != "nova":
+            registro["status_aplicacao"] = vaga["status"]
         if _SCHEMA_VAGAS_MOTIVOS is not False and "motivos_match" in vaga:
             registro["score_ia"] = int(vaga.get("score_ia") or 0)
             registro["motivos_match"] = vaga.get("motivos_match") or []
@@ -1510,7 +1556,7 @@ def preparar_rascunho_candidatura(service, vaga: dict, texto_email: str) -> str 
     Uma vez por vaga (marcado no cache) e dentro do budget diário "cartas".
     Retorna o id do rascunho ou None.
     """
-    uid = _vaga_uid(vaga.get("email_id"), vaga.get("cargo"), vaga.get("empresa"))
+    uid = _uid_da_vaga(vaga)
     if _cache_get("rascunho", uid, str):
         return None
     if not _tem_budget("cartas") or not gateway_disponivel():
@@ -1557,7 +1603,7 @@ def _uma_vez_chave(acao: str, chave: str, executar) -> None:
 
 def _uma_vez(acao: str, vaga: dict, executar) -> None:
     """_uma_vez_chave() para efeitos de uma vaga específica."""
-    _uma_vez_chave(acao, _vaga_uid(vaga.get("email_id"), vaga.get("cargo"), vaga.get("empresa")), executar)
+    _uma_vez_chave(acao, _uid_da_vaga(vaga), executar)
 
 
 def acoes_vaga_prioritaria(service, tasks_service, vaga: dict, texto_recrutador: str) -> None:
@@ -1602,6 +1648,7 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
     total_salvas  = 0
     total_outros  = 0
     total_atualizadas = 0
+    total_repetidas = 0
 
     for msg in msgs:
         try:
@@ -1667,11 +1714,11 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
             # específica com a âncora de texto correspondente (essencial
             # em digests com N vagas no mesmo e-mail, ex.: Catho/Indeed);
             # 3) fallback heurístico geral.
-            link = (
+            link_especifico = (
                 vaga_raw.get("link_candidatura")
                 or _achar_ancora_por_cargo(vaga_raw.get("cargo") or assunto, ancoras, ancoras_usadas)
-                or _extrair_link_candidatura(corpo, remetente, ancoras)
             )
+            link = link_especifico or _extrair_link_candidatura(corpo, remetente, ancoras)
 
             vaga = {
                 "email_id":          msg["id"],
@@ -1689,6 +1736,9 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
                 "tipo_email":        vaga_raw.get("tipo_email",         "nova_vaga"),
                 "status_candidatura":vaga_raw.get("status_candidatura", "nova"),
                 "link_candidatura":  link,
+                # o fallback genérico pode ser o mesmo link para todas as vagas
+                # do digest — só o link próprio da vaga serve para deduplicar
+                "link_especifico":   bool(link_especifico),
                 "descricao":         corpo[:400] if corpo else "",
                 "data_email":        data,
                 "status":            _status_do_email(vaga_raw.get("tipo_email"),
@@ -1710,9 +1760,21 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
                 total_atualizadas += 1
                 continue
 
+            # A mesma vaga já veio em OUTRO e-mail (digest repetido, ou o mesmo
+            # anúncio na Catho e no LinkedIn): não grava de novo nem repete
+            # push/tarefa/rascunho.
+            uid = _uid_da_vaga(vaga)
+            vista_em = _cache_get("vista", uid, str)
+            if vaga["tipo_email"] == "nova_vaga" and vista_em and vista_em != msg["id"]:
+                Log.info(f"    ↺ repetida (já veio em outro e-mail): {vaga['cargo']} @ {vaga['empresa']}")
+                total_repetidas += 1
+                continue
+
             salvo = salvar_vaga(sb, vaga, dry_run)
             if salvo:
                 total_salvas += 1
+                if not dry_run:
+                    _cache_set("vista", uid, msg["id"])
 
             total_vagas += 1
             flag = "🔥" if score >= 75 else ("⚡" if score >= 50 else "·")
@@ -1743,7 +1805,7 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
 
     Log.section(
         f"Vagas: {total_emails} e-mails | {total_vagas} vagas | "
-        f"{total_salvas} salvas | {total_atualizadas} status atualizados | "
+        f"{total_salvas} salvas | {total_repetidas} repetidas | {total_atualizadas} status atualizados | "
         f"{total_outros} outros módulos"
     )
 

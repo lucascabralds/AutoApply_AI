@@ -210,3 +210,19 @@ def test_acoes_ignoram_vaga_de_acompanhamento(ambiente, monkeypatch):
     monkeypatch.setattr(main, "notificar_vaga", lambda v: enviados.append(1) or True)
     main.acoes_vaga_prioritaria(None, None, {"cargo": "X", "score_gemini": 99, "tipo_email": "retorno"}, "")
     assert enviados == []
+
+
+def test_mesmo_digest_em_dois_emails_nao_duplica_vaga_nem_push(ambiente, monkeypatch):
+    enviados = []
+    monkeypatch.setattr(main, "telegram_configurado", lambda: True)
+    monkeypatch.setattr(main, "notificar_vaga", lambda v: enviados.append(v["cargo"]) or True)
+    gmail, sb = _FakeGmail(), _FakeSupabase()
+    copia = dict(gmail.mensagens["m1"], id="m3")
+    gmail.mensagens["m3"] = copia          # o log real mostra o mesmo digest chegando 2x
+
+    main.rodar_vagas(gmail, {"vagas_pai": "P", "vagas_alta": "A", "vagas_baixa": "B"}, sb,
+                     "newer_than:1d", dry_run=False)
+
+    assert len(sb.gravados) == 2                       # 2 vagas, não 4
+    assert enviados == ["Desenvolvedor Python"]        # push uma vez só
+    assert set(gmail.labels_aplicadas) == {"m1", "m3"}  # os dois e-mails saem da fila
