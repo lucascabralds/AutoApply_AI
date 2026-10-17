@@ -42,6 +42,7 @@ O algoritmo monitora ativamente a conta do Gmail e realiza a extração e o proc
 | `rota_ia_client.py` | Cliente HTTP do gateway Rota.IA com retry em 429/503. |
 | `google_auth.py` | OAuth2 único para todos os scripts (um só `token.json`, com todos os escopos). |
 | `gerar_dashboard.py` + `dashboard/template.html` | Dashboard HTML com os dados reais do Supabase (vagas por score, candidaturas, tecnologias, despesas, certificados). |
+| `diagnostico.py` | Confere toda a configuração (arquivos, escopos do token, Rota.IA, tabelas do Supabase, Telegram) e diz o que falta. |
 | `agendador.py` | Roda alertas, pipeline e briefing em horários definidos (usado no Docker). |
 | `calendario.py` | Vencimentos e agendamentos → eventos no Google Calendar (com lembrete). |
 | `notificador.py` | Envio de mensagens pelo Telegram. |
@@ -87,6 +88,7 @@ Crie um bot com o [@BotFather](https://t.me/BotFather), preencha `TELEGRAM_BOT_T
 ## 🚀 Uso
 
 ```bash
+python diagnostico.py              # confere .env, token, Rota.IA, Supabase e Telegram antes de tudo
 python main.py                     # todos os módulos, e-mails das últimas 24h
 python main.py --dias 7            # amplia a janela
 python main.py --modulo vagas      # vagas | certificados | alertas | geral
