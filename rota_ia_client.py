@@ -38,6 +38,9 @@ logger = logging.getLogger(__name__)
 ROTA_IA_URL     = (os.getenv("ROTA_IA_URL") or "http://localhost:8787/v1").rstrip("/")
 ROTA_IA_API_KEY = os.getenv("ROTA_IA_API_KEY")
 ROTA_IA_MODEL   = os.getenv("ROTA_IA_MODEL", "auto")
+# Sem max_tokens explícito valia o padrão do provedor escolhido pelo gateway
+# (às vezes bem baixo) e digests com várias vagas voltavam cortados no meio.
+ROTA_IA_MAX_TOKENS = int(os.getenv("ROTA_IA_MAX_TOKENS", "2048"))
 
 CHAT_COMPLETIONS_ENDPOINT = f"{ROTA_IA_URL}/chat/completions"
 
@@ -158,7 +161,7 @@ def _extrair_retry_delay(texto: str) -> float:
 
 
 def chamar_ia(prompt: str, max_tentativas: int = 3, temperature: float = 0.1,
-              timeout: int = 60) -> str:
+              timeout: int = 60, max_tokens: int | None = None) -> str:
     """
     Envia o prompt para o gateway Rota.IA (POST {ROTA_IA_URL}/chat/completions)
     e retorna o texto de resposta do modelo escolhido pela fila de fallback.
@@ -184,6 +187,7 @@ def chamar_ia(prompt: str, max_tentativas: int = 3, temperature: float = 0.1,
         "model": ROTA_IA_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": temperature,
+        "max_tokens": max_tokens or ROTA_IA_MAX_TOKENS,
     }
 
     ultima_exc = None
