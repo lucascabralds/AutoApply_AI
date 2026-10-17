@@ -2012,12 +2012,25 @@ def rodar_certificados(service, drive_service, labels: dict, sb: Client | None,
 # 9. MÓDULO DE ALERTAS DE ACESSO (OTP / Recuperação de Senha)
 # ===========================================================================
 
+# Palavras de assunto que indicam código/login/senha — em português E inglês.
+# Antes só havia termos em português (+ "otp"), e e-mails como
+# "[GitHub] Sudo email verification code" passavam direto. Falsos positivos
+# ("código de desconto") são descartados pela IA como "irrelevante".
+TERMOS_ASSUNTO_ALERTA = [
+    "código", "codigo", "code", "senha", "password", "login", "pin", "otp", "2fa",
+    "verificação", "verificacao", "verification", "verify", "autenticação", "authentication",
+    "recuperação", "recuperacao", "reset", "acesso", "token", "ticket",
+]
+
+
 def rodar_alertas(service, labels: dict, sb: Client | None, query_dias: int, dry_run: bool):
     Log.section("Módulo 3 — Alertas de Acesso (OTP / Senhas)")
 
+    # Promoções/Social ficam de fora: "código de desconto" e afins gastariam o
+    # budget diário de alertas e um OTP real poderia ficar sem análise.
     query = (
-        "subject:(código OR senha OR login OR password OR pin OR recuperação OR ticket OR otp) "
-        f"newer_than:{query_dias}d"
+        f"subject:({' OR '.join(TERMOS_ASSUNTO_ALERTA)}) "
+        f"-category:promotions -category:social newer_than:{query_dias}d"
     )
     Log.info(f"Query: '{query}'")
 

@@ -77,3 +77,10 @@ def test_escapar_html_aceita_numero():
     assert escapar_html(482913) == "482913"
     assert escapar_html(None) == ""
     assert escapar_html("<b>") == "&lt;b&gt;"
+
+
+def test_busca_de_alertas_pega_otp_em_ingles():
+    termos = set(main.TERMOS_ASSUNTO_ALERTA)
+    assunto = "[GitHub] Sudo email verification code".lower()
+    assert any(t in assunto.split() for t in termos)
+    assert {"código", "senha", "otp"} <= termos   # os termos antigos continuam
