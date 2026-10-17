@@ -46,13 +46,34 @@ logger = logging.getLogger(__name__)
 # e troca sozinho de provedor se algum falhar. Ver rota_ia_client.py.
 # ---------------------------------------------------------------------------
 
+# Status da última função pública deste módulo — o pipeline usa para decidir
+# se cobra budget e se pode cachear o resultado:
+#   "heuristica" → respondeu sem chamar a IA (nada a cobrar)
+#   "ok"         → a IA respondeu e a resposta foi lida
+#   "falha"      → gateway fora/erro/JSON irrecuperável (não cachear, tentar depois)
+# As funções continuam sem levantar exceção para os scripts antigos.
+_status = "heuristica"
+
+
+def status_ultima_chamada() -> str:
+    return _status
+
+
+def _definir_status(novo: str) -> None:
+    global _status
+    _status = novo
+
+
 def _chamar_gemini(prompt: str, max_tentativas: int = 3) -> str:
     """
     Envia o prompt para o gateway Rota.IA com retry automático em 429/503.
     Mantém o nome original da função por compatibilidade com o resto do módulo.
     Raises a última exceção se todas as tentativas falharem.
     """
-    return _chamar_rota_ia(prompt, max_tentativas=max_tentativas)
+    _definir_status("falha")   # vira "ok" só se a resposta chegar
+    resposta = _chamar_rota_ia(prompt, max_tentativas=max_tentativas)
+    _definir_status("ok")
+    return resposta
 
 
 # ---------------------------------------------------------------------------
@@ -137,8 +158,12 @@ def _tentar_reparar_json_truncado(texto: str):
 
 
 def _parse_json(raw: str) -> dict | list:
-    """Converte texto bruto do Gemini em dict ou list de forma segura."""
+    """
+    Converte texto bruto do Gemini em dict ou list de forma segura.
+    Resposta vazia ou irrecuperável marca o status como "falha".
+    """
     if not raw:
+        _definir_status("falha")
         return {}
 
     texto = raw.strip()
@@ -174,6 +199,7 @@ def _parse_json(raw: str) -> dict | list:
         return reparado
 
     logger.warning(f"Gemini JSON inválido (irrecuperável): {raw[:100]}")
+    _definir_status("falha")
     return {}
 
 
@@ -252,6 +278,7 @@ def classificar_email(assunto: str, remetente: str, corpo_preview: str) -> str:
     Retorna uma das categorias:
       "vaga" | "certificado" | "alerta" | "agendamento" | "financeiro" | "servico" | "outro"
     """
+    _definir_status("heuristica")
     # Tenta heurística primeiro (sem custo de token)
     resultado = _classificar_heuristica(assunto, remetente, corpo_preview)
     if resultado:
@@ -295,6 +322,7 @@ Prévia: {corpo_preview[:400]}
         return "outro"
     except Exception as e:
         logger.warning(f"classificar_email falhou: {e} — assumindo 'outro'")
+        _definir_status("falha")
         return "outro"
 
 
@@ -316,6 +344,7 @@ def extrair_vagas(assunto: str, remetente: str, corpo: str,
 
     Retorna lista de dicts com a estrutura abaixo. Retorna [] em caso de falha.
     """
+    _definir_status("heuristica")
     # Prepara bloco de links para injetar no prompt
     bloco_links = ""
     if links_html:
@@ -371,6 +400,8 @@ Corpo do e-mail:
     try:
         raw = _chamar_gemini(prompt)
         data = _parse_json(raw)
+        if _status == "falha":
+            return []   # sem isto, o {} irrecuperável virava [{}] → uma vaga fictícia
 
         # A resposta pode ser lista diretamente ou dict com chave "vagas"
         if isinstance(data, list):
@@ -412,6 +443,7 @@ Corpo do e-mail:
 
     except Exception as e:
         logger.warning(f"extrair_vagas falhou: {e}")
+        _definir_status("falha")
         return []
 
 
@@ -432,6 +464,7 @@ def analisar_acesso(remetente: str, assunto: str, corpo: str) -> dict:
       "justificativa_curta": str
     }
     """
+    _definir_status("heuristica")
     prompt = f"""
 Você é um assistente de segurança digital.
 Analise o e-mail e responda APENAS em JSON estrito (sem crases):
@@ -458,6 +491,7 @@ Corpo: {corpo[:800]}
         return data if isinstance(data, dict) else {}
     except Exception as e:
         logger.warning(f"analisar_acesso falhou: {e}")
+        _definir_status("falha")
         return {}
 
 
@@ -480,6 +514,7 @@ def classificar_email_geral(remetente: str, assunto: str, corpo: str) -> dict:
       "requer_acao":     bool
     }
     """
+    _definir_status("heuristica")
     prompt = f"""
 Você é um assistente pessoal que organiza e-mails.
 Analise o e-mail e responda APENAS em JSON estrito (sem crases):
@@ -513,6 +548,7 @@ Corpo: {corpo[:800]}
         return data if isinstance(data, dict) else {}
     except Exception as e:
         logger.warning(f"classificar_email_geral falhou: {e}")
+        _definir_status("falha")
         return {}
 
 
@@ -534,6 +570,7 @@ def gerar_carta_apresentacao(vaga: dict, perfil: str) -> str:
     perfil (a IA não pode inventar experiência). Retorna texto puro, ou ""
     em caso de falha.
     """
+    _definir_status("heuristica")
     detalhes = "\n".join(
         f"- {rotulo}: {valor}" for rotulo, valor in [
             ("Cargo", vaga.get("cargo")),
@@ -567,6 +604,7 @@ Responda apenas com o texto da carta.
         texto = _chamar_gemini(prompt).strip()
     except Exception as e:
         logger.warning(f"gerar_carta_apresentacao falhou: {e}")
+        _definir_status("falha")
         return ""
     # Remove cercas de markdown que alguns modelos insistem em usar
     return re.sub(r"^```\w*\s*|\s*```$", "", texto).strip()

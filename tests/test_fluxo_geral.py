@@ -53,7 +53,7 @@ def ambiente(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "_BUDGET_PATH", str(tmp_path / "b.json"))
     monkeypatch.setattr(main, "_PENDENTES_IA", set())
     monkeypatch.setattr(main, "gateway_disponivel", lambda: True)
-    monkeypatch.setattr(main, "_ia_respondeu", lambda: True)
+    monkeypatch.setattr(main, "_status_ia", lambda: "ok")
     monkeypatch.setattr(main, "_GEMINI_BUDGET", {"data": dt.date.today().isoformat(),
                                                  "vagas": 0, "geral": 0, "alertas": 0, "cartas": 0})
     vencimento = (dt.date.today() + dt.timedelta(days=10)).strftime("%d/%m/%Y")
@@ -101,3 +101,25 @@ def test_sem_calendar_configurado_nao_tenta_agendar(ambiente):
     gmail, _ = ambiente
     main.rodar_emails_gerais(gmail, {}, _FakeSB(), "newer_than:1d", dry_run=False, calendar_service=None)
     assert main._cache_get("evento", "v1", str) is None
+
+
+def test_ia_indisponivel_deixa_vencimento_para_depois(ambiente, monkeypatch):
+    gmail, _ = ambiente
+    monkeypatch.setattr(main, "gateway_disponivel", lambda: False)
+    main.rodar_emails_gerais(gmail, {"geral_pai": "G"}, _FakeSB(), "newer_than:1d", dry_run=False,
+                             calendar_service=_FakeCalendar())
+    assert "v1" not in gmail.labels_aplicadas   # volta com data/valor quando a IA responder
+
+
+def test_vistoria_do_detran_vira_agendamento(ambiente, monkeypatch):
+    gmail, _ = ambiente
+    gmail.mensagens = {"a1": _msg("Vistoria veicular agendada", "Detran <noreply@detran.sp.gov.br>",
+                                  "Sua vistoria veicular está marcada")}
+    data = (dt.date.today() + dt.timedelta(days=3)).strftime("%d/%m/%Y")
+    monkeypatch.setattr(main, "_gs_classificar_geral", lambda *a: {
+        "categoria": "agendamento", "remetente_nome": "Detran-SP", "data_evento": f"{data} às 14h"})
+    cal = _FakeCalendar()
+    main.rodar_emails_gerais(gmail, {"geral_pai": "G", "geral_agendamento": "G_AG"}, _FakeSB(),
+                             "newer_than:1d", dry_run=False, calendar_service=cal)
+    assert gmail.labels_aplicadas["a1"] == ["G", "G_AG"]
+    assert cal.eventos[0]["summary"] == "📅 Detran-SP" and "dateTime" in cal.eventos[0]["start"]

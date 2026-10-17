@@ -598,9 +598,16 @@ def _iterar_partes(payload: dict):
 
 
 def _eh_inline(parte: dict) -> bool:
-    """Imagem embutida no corpo (logo, assinatura): tem Content-ID ou disposition inline."""
+    """
+    Imagem embutida no corpo (logo, assinatura). A Content-Disposition manda:
+    o Gmail põe Content-ID até em anexos de verdade ("attachment"), então o
+    Content-ID só decide quando não há disposition.
+    """
     headers = {h["name"].lower(): h["value"].lower() for h in parte.get("headers", [])}
-    return "content-id" in headers or headers.get("content-disposition", "").startswith("inline")
+    disposicao = headers.get("content-disposition", "").strip()
+    if disposicao:
+        return disposicao.startswith("inline")
+    return "content-id" in headers
 
 
 def _anexos_certificado(partes: list[dict]) -> list[dict]:
@@ -1227,8 +1234,8 @@ def _nome_seguro(texto: str, ext: str = "") -> str:
 #   cache local (por gmail_message_id) → heurística grátis → budget diário.
 # As funções de gemini_service nunca levantam exceção: devolvem {} / [].
 
-import rota_ia_client
 from rota_ia_client import gateway_disponivel
+from gemini_service import status_ultima_chamada as _status_ia
 from gemini_service import (
     classificar_email       as _gs_classificar,
     extrair_vagas           as _gs_extrair_vagas,
@@ -1253,11 +1260,6 @@ def _cache_set(tipo: str, msg_id: str, valor, permitir_vazio: bool = False) -> N
     if msg_id and (valor or (permitir_vazio and valor is not None)):
         _GEMINI_CACHE[_cache_key(tipo, msg_id)] = valor
         _salvar_cache(_GEMINI_CACHE)
-
-
-def _ia_respondeu() -> bool:
-    """A última chamada de IA chegou ao gateway? Falhas não gastam budget nem vão para o cache."""
-    return rota_ia_client.ultima_chamada_ok
 
 
 # E-mails que não deu para classificar agora (IA fora do ar / falhou). O
@@ -1312,8 +1314,10 @@ def classificar_email_pipeline(assunto: str, remetente: str, corpo_preview: str,
 
     if gateway_disponivel():
         resultado = _gs_classificar(assunto, remetente, corpo_preview)
-        if _ia_respondeu():
-            _consumir_budget("geral")
+        status = _status_ia()
+        if status != "falha":
+            if status == "ok":   # a heurística do gemini_service não chama a IA
+                _consumir_budget("geral")
             _cache_set("classif", msg_id, resultado)
             return resultado
 
@@ -1373,7 +1377,7 @@ def extrair_vagas_pipeline(assunto: str, remetente: str, corpo: str,
 
     if gateway_disponivel():
         resultado = _gs_extrair_vagas(assunto, remetente, corpo, links_html=ancoras)
-        if _ia_respondeu():
+        if _status_ia() == "ok":
             _consumir_budget("vagas")
             # Inclusive [] — senão um aviso sem vaga real ("sua candidatura
             # foi visualizada") voltaria para a IA a cada execução.
@@ -1400,26 +1404,33 @@ def analisar_acesso_pipeline(remetente: str, assunto: str, corpo: str,
         return {}
 
     resultado = _gs_analisar_acesso(remetente, assunto, corpo)
-    if _ia_respondeu():
+    if _status_ia() == "ok":
         _consumir_budget("alertas")
         _cache_set("alerta", msg_id, resultado)
     return resultado
 
 
 def classificar_geral_pipeline(remetente: str, assunto: str, corpo: str,
-                               msg_id: str = "") -> dict:
-    """Extrai info de agendamentos e financeiros. Usa cache + budget geral."""
+                               msg_id: str = "") -> dict | None:
+    """
+    Extrai info de agendamentos, vencimentos etc. Usa cache + budget geral.
+    Retorna {} quando o budget acabou (segue só com a heurística) e None
+    quando a IA está indisponível/falhou (vale tentar de novo depois).
+    """
     cached = _cache_get("geral", msg_id, dict)
     if cached is not None:
         return cached
 
-    if not _tem_budget("geral") or not gateway_disponivel():
+    if not _tem_budget("geral"):
         return {}
+    if not gateway_disponivel():
+        return None
 
     resultado = _gs_classificar_geral(remetente, assunto, corpo)
-    if _ia_respondeu():
-        _consumir_budget("geral")
-        _cache_set("geral", msg_id, resultado)
+    if _status_ia() != "ok":
+        return None
+    _consumir_budget("geral")
+    _cache_set("geral", msg_id, resultado)
     return resultado
 
 
@@ -1458,7 +1469,7 @@ def preparar_rascunho_candidatura(service, vaga: dict, texto_email: str) -> str 
         return None
 
     carta = _gs_gerar_carta(vaga, perfil)
-    if _ia_respondeu():
+    if _status_ia() == "ok":
         _consumir_budget("cartas")
     if not carta:
         return None
@@ -2065,14 +2076,17 @@ def rodar_alertas(service, labels: dict, sb: Client | None, query_dias: int, dry
 # ===========================================================================
 
 # Palavras-chave para classificar e-mails gerais por categoria
+# Veículo usa regex com limite de palavra: "seguro auto" não pode casar com
+# "pagamento seguro automático", nem "licenciamento" com licença de software.
+_PADROES_VEICULO = re.compile(
+    r"\b(detran|ipva|crlv|renavam|dpvat|semparar|conectcar|veloe"
+    r"|licenciamento (?:anual|do ve[ií]culo|\d{4})"
+    r"|multa de tr[aâ]nsito|auto de infra[cç][aã]o|notifica[cç][aã]o de autua[cç][aã]o|infra[cç][aã]o de tr[aâ]nsito"
+    r"|carteira nacional de habilita[cç][aã]o|renova[cç][aã]o da cnh"
+    r"|seguro auto|vistoria veicular)\b"
+)
+
 _PADROES_GERAL = {
-    "veiculo": [
-        "detran", "ipva", "licenciamento", "crlv", "renavam", "dpvat",
-        "multa de trânsito", "multa de transito", "auto de infração", "auto de infracao",
-        "notificação de autuação", "notificacao de autuacao", "infração de trânsito",
-        "carteira nacional de habilitação", "renovação da cnh", "renovacao da cnh",
-        "seguro auto", "vistoria veicular", "semparar", "conectcar", "veloe",
-    ],
     "agendamento": [
         "agendamento", "agendado", "confirmado", "reserva", "confirma sua visita",
         "confirmação de agendamento", "booksy", "scheduling", "appointment",
@@ -2155,6 +2169,9 @@ def _normalizar_categoria_geral(categoria_ia: str | None, categoria_heuristica: 
 def _categoria_heuristica(assunto: str, corpo: str) -> str:
     """Classificação rápida sem consumir token do Gemini."""
     txt = (assunto + " " + corpo[:300]).lower()
+    # Veículo antes de financeiro: um boleto de IPVA é "veículo"
+    if _PADROES_VEICULO.search(txt):
+        return "veiculo"
     for cat, padroes in _PADROES_GERAL.items():
         if any(p in txt for p in padroes):
             return cat
@@ -2237,10 +2254,17 @@ def rodar_emails_gerais(service, labels: dict, sb: Client | None, query: str, dr
         if _tem_budget("geral") and categoria in ("agendamento", "financeiro", "veiculo", "comunicado"):
             try:
                 analise = classificar_geral_pipeline(remetente, assunto, corpo, msg["id"])
-                # A heurística de veículo é bem específica (Detran, IPVA...) —
-                # a IA tende a chamar isso só de "financeiro"; mantém veículo.
-                if categoria != "veiculo":
-                    categoria = _normalizar_categoria_geral(analise.get("categoria"), categoria)
+                if analise is None:
+                    # IA fora agora: sem label, para voltar com data/valor (e evento
+                    # no Calendar) quando o gateway responder
+                    Log.info(f"  ⏸ IA indisponível — fica para a próxima: {assunto[:50]}")
+                    continue
+                # A heurística de veículo é bem específica (Detran, IPVA...) e a
+                # IA tende a chamar isso só de "financeiro" — mantém veículo,
+                # exceto quando é um agendamento (vistoria, exame da CNH).
+                categoria_ia = _normalizar_categoria_geral(analise.get("categoria"), categoria)
+                if categoria != "veiculo" or categoria_ia == "agendamento":
+                    categoria = categoria_ia
             except Exception as e:
                 Log.warn(f"  Gemini geral falhou: {e}")
 

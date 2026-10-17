@@ -83,7 +83,7 @@ def ambiente(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "_SCHEMA_VAGAS_V3", None)
     monkeypatch.setattr(main.time, "sleep", lambda s: None)
     monkeypatch.setattr(main, "telegram_configurado", lambda: False)
-    monkeypatch.setattr(main, "_ia_respondeu", lambda: True)
+    monkeypatch.setattr(main, "_status_ia", lambda: "ok")
 
     chamadas_ia = []
 
@@ -159,7 +159,7 @@ def test_email_sem_vaga_real_e_marcado_e_nao_volta_para_a_ia(ambiente, monkeypat
 
 
 def test_falha_da_ia_nao_gasta_budget_nem_cacheia(ambiente, monkeypatch):
-    monkeypatch.setattr(main, "_ia_respondeu", lambda: False)
+    monkeypatch.setattr(main, "_status_ia", lambda: "falha")
     monkeypatch.setattr(main, "_GEMINI_BUDGET", {"data": main.datetime.date.today().isoformat(),
                                                  "vagas": 0, "geral": 0, "alertas": 0, "cartas": 0})
     gmail = _FakeGmail()

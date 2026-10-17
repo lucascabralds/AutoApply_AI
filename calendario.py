@@ -62,34 +62,52 @@ def parsear_data_hora(texto: str | None, hoje: datetime.date | None = None
     hoje = hoje or datetime.date.today()
     t = str(texto).lower()
 
-    data = None
+    data, fim = None, 0
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})", t)
     if m:
         a, mo, d = (int(x) for x in m.groups())
-        data = _data_segura(a, mo, d)
+        data, fim = _data_segura(a, mo, d), m.end()
     if not data:
         m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", t)
         if m:
             d, mo = int(m.group(1)), int(m.group(2))
             a = int(m.group(3)) if m.group(3) else _ano_provavel(d, mo, hoje)
-            data = _data_segura(a + 2000 if a < 100 else a, mo, d)
+            data, fim = _data_segura(a + 2000 if a < 100 else a, mo, d), m.end()
     if not data:
         m = re.search(r"\b(\d{1,2})\s+de\s+([a-zç]+)(?:\s+de\s+(\d{4}))?", t)
         if m and m.group(2) in _MESES:
             d, mo = int(m.group(1)), _MESES[m.group(2)]
             a = int(m.group(3)) if m.group(3) else _ano_provavel(d, mo, hoje)
-            data = _data_segura(a, mo, d)
+            data, fim = _data_segura(a, mo, d), m.end()
     if not data:
         return None, None
+    return data, _hora_depois_da_data(t[fim:])
 
-    hora = None
-    # "14h", "14h30", "14:30", "às 9h" — ignora o "2026-06-29T..." já consumido como data
-    m = re.search(r"(?:\bàs\s+|\bas\s+|t|\s|^)(\d{1,2})(?:h(\d{2})?|:(\d{2}))(?!\d)", t)
-    if m:
-        h, mi = int(m.group(1)), int(m.group(2) or m.group(3) or 0)
-        if 0 <= h <= 23 and 0 <= mi <= 59:
-            hora = datetime.time(h, mi)
-    return data, hora
+
+def _hora_depois_da_data(resto: str) -> datetime.time | None:
+    """
+    Hora só é aceita em formatos inequívocos depois da data: "14:30",
+    "T14:30", "às 9h30", "das 14h" ou "14h" logo em seguida à data. Assim
+    "duração 2h" não vira 02:00. Meia-noite (00:00) é tratada como "sem
+    horário" — é como a IA escreve uma data pura em ISO.
+    """
+    padroes = [
+        r"^t?\s*(\d{1,2}):(\d{2})",                        # T14:30 / " 14:30"
+        r"^[\s,–-]*(\d{1,2})h(\d{2})?\b",                    # "28/10 14h"
+        r"\b(?:às|as|das|a partir das)\s+(\d{1,2})(?:h(\d{2})?\b|:(\d{2}))",
+        r"\b(\d{1,2}):(\d{2})\b",
+    ]
+    for padrao in padroes:
+        m = re.search(padrao, resto)
+        if not m:
+            continue
+        grupos = [g for g in m.groups() if g is not None]
+        h = int(grupos[0])
+        mi = int(grupos[1]) if len(grupos) > 1 else 0
+        if 0 <= h <= 23 and 0 <= mi <= 59 and (h, mi) != (0, 0):
+            return datetime.time(h, mi)
+        return None
+    return None
 
 
 def _data_segura(a: int, mo: int, d: int) -> datetime.date | None:
@@ -120,6 +138,14 @@ def montar_evento(titulo: str, data: datetime.date, hora: datetime.time | None =
     return evento
 
 
+# Só o que é A PAGAR vira "Vence:" — recibo, PIX enviado ou pedágio já
+# cobrado não (a não ser que a IA diga que o e-mail pede ação).
+_SUBCATEGORIAS_A_PAGAR = {
+    "boleto_fatura", "cobranca",
+    "veiculo_ipva", "veiculo_licenciamento", "veiculo_multa", "veiculo_seguro", "veiculo_cnh",
+}
+
+
 def evento_do_registro(registro: dict, hoje: datetime.date | None = None) -> dict | None:
     """
     Converte um e-mail geral já classificado em evento, ou None se não houver
@@ -127,6 +153,9 @@ def evento_do_registro(registro: dict, hoje: datetime.date | None = None) -> dic
     """
     categoria = registro.get("categoria")
     if categoria not in ("agendamento", "financeiro", "veiculo"):
+        return None
+    if (categoria != "agendamento" and registro.get("subcategoria") not in _SUBCATEGORIAS_A_PAGAR
+            and not registro.get("requer_acao")):
         return None
     hoje = hoje or datetime.date.today()
     data, hora = parsear_data_hora(registro.get("data_evento"), hoje)

@@ -45,8 +45,9 @@ CHAT_COMPLETIONS_ENDPOINT = f"{ROTA_IA_URL}/chat/completions"
 # Circuit breaker: se o gateway não responde (Rota.IA desligado, porta
 # errada...), cada e-mail esperava todas as tentativas e ainda gastava o
 # budget diário. Quando uma chamada esgota as tentativas sem conseguir
-# conectar, as próximas falham na hora durante ROTA_IA_PAUSA_SEG segundos —
-# e o pipeline usa a heurística local nesse intervalo.
+# CONECTAR, as próximas falham na hora durante ROTA_IA_PAUSA_SEG segundos —
+# e o pipeline usa a heurística local nesse intervalo. Timeout (provedor
+# lento, mas no ar) não pausa: um digest grande não pode calar os alertas.
 #
 # A pausa fica gravada em disco: o agendador abre um processo novo a cada
 # minuto, e uma pausa só em memória seria esquecida a cada execução.
@@ -55,9 +56,7 @@ PAUSA_SEG    = int(os.getenv("ROTA_IA_PAUSA_SEG", "300"))
 _DADOS_DIR   = os.getenv("AUTOAPPLY_DADOS_DIR") or os.path.dirname(os.path.abspath(__file__))
 _PAUSA_PATH  = os.path.join(_DADOS_DIR, "rota_ia_pausa.json")
 
-# True se a última chamar_ia() recebeu resposta do gateway — o pipeline usa
-# isso para não cobrar budget nem cachear resultado de chamadas que falharam.
-ultima_chamada_ok = False
+_cache_pausa: tuple[float, float] = (-1.0, 0.0)   # (mtime do arquivo, pausado_ate)
 
 
 class GatewayIndisponivel(RuntimeError):
@@ -65,11 +64,19 @@ class GatewayIndisponivel(RuntimeError):
 
 
 def _pausado_ate() -> float:
+    """Lê a pausa do disco só quando o arquivo muda (é consultada várias vezes por e-mail)."""
+    global _cache_pausa
     try:
-        with open(_PAUSA_PATH, encoding="utf-8") as f:
-            return float(json.load(f).get("pausado_ate", 0))
-    except (OSError, ValueError, AttributeError):
+        mtime = os.path.getmtime(_PAUSA_PATH)
+    except OSError:
         return 0.0
+    if mtime != _cache_pausa[0]:
+        try:
+            with open(_PAUSA_PATH, encoding="utf-8") as f:
+                _cache_pausa = (mtime, float(json.load(f).get("pausado_ate", 0)))
+        except (OSError, ValueError, AttributeError):
+            _cache_pausa = (mtime, 0.0)
+    return _cache_pausa[1]
 
 
 def _gravar_pausa(ate: float) -> None:
@@ -97,8 +104,6 @@ def _registrar_falha_de_conexao() -> None:
 
 
 def _registrar_sucesso() -> None:
-    global ultima_chamada_ok
-    ultima_chamada_ok = True
     if _pausado_ate():
         _gravar_pausa(0)
 
@@ -124,9 +129,6 @@ def chamar_ia(prompt: str, max_tentativas: int = 3, temperature: float = 0.1,
     Faz retry automático em 429 (rate limit) e 503 (provedor indisponível).
     Levanta a última exceção se todas as tentativas falharem.
     """
-    global ultima_chamada_ok
-    ultima_chamada_ok = False
-
     if not gateway_disponivel():
         raise GatewayIndisponivel(f"Rota.IA indisponível em {ROTA_IA_URL} (pausa ativa)")
 
@@ -169,14 +171,19 @@ def chamar_ia(prompt: str, max_tentativas: int = 3, temperature: float = 0.1,
                 continue
 
             resp.raise_for_status()
-            data = resp.json()
+            # Lê o conteúdo ANTES de registrar sucesso: um 200 com {"error": ...}
+            # (sem "choices") é falha, não resposta da IA.
+            conteudo = resp.json()["choices"][0]["message"]["content"]
             _registrar_sucesso()
-            return data["choices"][0]["message"]["content"]
+            return conteudo
 
         except (requests.ConnectionError, requests.Timeout) as exc:
             ultima_exc = exc
             if tentativa == max_tentativas:
-                _registrar_falha_de_conexao()
+                # ReadTimeout = conectou mas o provedor demorou; ConnectTimeout
+                # (subclasse de ConnectionError) = gateway inalcançável → pausa
+                if not isinstance(exc, requests.ReadTimeout):
+                    _registrar_falha_de_conexao()
                 break
             logger.warning(
                 f"Rota.IA — sem conexão (tentativa {tentativa}/{max_tentativas}): {exc}"

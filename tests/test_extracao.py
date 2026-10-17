@@ -110,3 +110,20 @@ def test_normalizar_categoria_geral():
     assert main._normalizar_categoria_geral("outro", "comunicado") == "comunicado"
     assert main._normalizar_categoria_geral(None, "financeiro") == "financeiro"
     assert main._normalizar_categoria_geral("inventada", "agendamento") == "agendamento"
+
+
+def test_heuristica_de_veiculo_nao_pega_falsos_positivos():
+    assert main._categoria_heuristica("IPVA 2027 disponível", "") == "veiculo"
+    assert main._categoria_heuristica("Licenciamento 2026 do seu carro", "") == "veiculo"
+    assert main._categoria_heuristica("Notificação de autuação", "") == "veiculo"
+    assert main._categoria_heuristica("Renovação do licenciamento de software Microsoft", "") != "veiculo"
+    assert main._categoria_heuristica("Pagamento seguro automático confirmado", "") != "veiculo"
+
+
+def test_anexo_com_content_id_mas_disposition_attachment_nao_e_inline():
+    pdf = {"filename": "c.pdf", "mimeType": "application/pdf",
+           "headers": [{"name": "Content-ID", "value": "<f_abc>"},
+                       {"name": "Content-Disposition", "value": "attachment; filename=c.pdf"}]}
+    logo = {"filename": "l.png", "mimeType": "image/png", "headers": [{"name": "Content-ID", "value": "<x>"}]}
+    assert not main._eh_inline(pdf)
+    assert main._eh_inline(logo)

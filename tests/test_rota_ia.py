@@ -32,7 +32,7 @@ def test_gateway_fora_do_ar_abre_o_circuito(monkeypatch):
     monkeypatch.setattr(r.requests, "post", post_falho)
     with pytest.raises(requests.ConnectionError):
         r.chamar_ia("oi", max_tentativas=3)
-    assert len(chamadas) == 3 and not r.ultima_chamada_ok
+    assert len(chamadas) == 3
     assert not r.gateway_disponivel()
 
     with pytest.raises(r.GatewayIndisponivel):
@@ -50,7 +50,7 @@ def test_sucesso_fecha_o_circuito(monkeypatch):
     r._gravar_pausa(r.time.time() - 1)   # pausa vencida
     monkeypatch.setattr(r.requests, "post", lambda *a, **k: _Resp())
     assert r.chamar_ia("oi") == '{"ok": true}'
-    assert r.ultima_chamada_ok and r.gateway_disponivel()
+    assert r.gateway_disponivel()
     assert r._pausado_ate() == 0.0
 
 
@@ -64,4 +64,25 @@ def test_erro_http_nao_abre_o_circuito(monkeypatch):
     monkeypatch.setattr(r.requests, "post", lambda *a, **k: _Erro())
     with pytest.raises(requests.HTTPError):
         r.chamar_ia("oi", max_tentativas=1)
-    assert r.gateway_disponivel() and not r.ultima_chamada_ok
+    assert r.gateway_disponivel()
+
+
+def test_timeout_de_leitura_nao_pausa_o_gateway(monkeypatch):
+    def lento(*a, **k):
+        raise requests.ReadTimeout("provedor demorou")
+    monkeypatch.setattr(r.requests, "post", lento)
+    with pytest.raises(requests.ReadTimeout):
+        r.chamar_ia("oi", max_tentativas=2)
+    assert r.gateway_disponivel()
+
+
+def test_200_sem_choices_e_falha_e_nao_fecha_a_pausa(monkeypatch):
+    r._gravar_pausa(r.time.time() - 1)   # pausa vencida, arquivo ainda existe
+
+    class _SemChoices(_Resp):
+        def json(self):
+            return {"error": "todos os provedores falharam"}
+    monkeypatch.setattr(r.requests, "post", lambda *a, **k: _SemChoices())
+    with pytest.raises(KeyError):
+        r.chamar_ia("oi", max_tentativas=1)
+    assert r._pausado_ate() != 0.0   # não registrou sucesso
