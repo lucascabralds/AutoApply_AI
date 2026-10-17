@@ -66,6 +66,7 @@ from seguranca import redigir_segredo
 from services.gmail.add_task import criar_tarefa_vaga
 import calendario
 import candidatura
+import match_vagas
 
 # ---------------------------------------------------------------------------
 # Supabase
@@ -888,6 +889,9 @@ def _vaga_uid(email_id: str, cargo: str | None, empresa: str | None) -> str:
 
 # None = ainda não testado nesta execução; False = banco sem a migração v3
 _SCHEMA_VAGAS_V3: bool | None = None
+# Mesma ideia para as colunas do score explicável (score_ia, motivos_match):
+# banco sem elas continua gravando a vaga, só sem os motivos.
+_SCHEMA_VAGAS_MOTIVOS: bool | None = None
 
 
 def _erro_de_schema(exc: Exception) -> bool:
@@ -905,7 +909,7 @@ def _erro_de_schema(exc: Exception) -> bool:
 
 
 def salvar_vaga(sb: Client | None, vaga: dict, dry_run: bool = False) -> bool:
-    global _SCHEMA_VAGAS_V3
+    global _SCHEMA_VAGAS_V3, _SCHEMA_VAGAS_MOTIVOS
     if dry_run:
         Log.info(f"  [DRY-RUN] vagas_extraidas: {vaga.get('cargo')} @ {vaga.get('empresa')}")
         return True
@@ -932,8 +936,22 @@ def salvar_vaga(sb: Client | None, vaga: dict, dry_run: bool = False) -> bool:
             "data_email":        vaga.get("data_email"),
             "status_aplicacao":  vaga.get("status", "nova"),
         }
+        if _SCHEMA_VAGAS_MOTIVOS is not False and "motivos_match" in vaga:
+            registro["score_ia"] = int(vaga.get("score_ia") or 0)
+            registro["motivos_match"] = vaga.get("motivos_match") or []
         try:
-            sb.table("vagas_extraidas").upsert(registro, on_conflict="vaga_uid").execute()
+            try:
+                sb.table("vagas_extraidas").upsert(registro, on_conflict="vaga_uid").execute()
+            except Exception as e:
+                if "motivos_match" not in registro or not _erro_de_schema(e):
+                    raise
+                # Banco ainda sem as colunas do score explicável: grava sem elas
+                _SCHEMA_VAGAS_MOTIVOS = False
+                Log.warn("  Tabela vagas_extraidas sem score_ia/motivos_match — rode supabase/schema.sql "
+                         "para guardar os motivos do score. Gravando sem eles.")
+                registro.pop("score_ia")
+                registro.pop("motivos_match")
+                sb.table("vagas_extraidas").upsert(registro, on_conflict="vaga_uid").execute()
             _SCHEMA_VAGAS_V3 = True
             return True
         except Exception as e:
@@ -1479,6 +1497,8 @@ def notificar_vaga(vaga: dict) -> bool:
         escapar_html(f"{vaga['empresa']} · {vaga.get('modelo_trabalho') or 'Não informado'}"
                      + (f" · {vaga['local']}" if vaga.get("local") else "")),
     ]
+    if vaga.get("motivos_match"):
+        linhas.append(f"<i>{escapar_html(match_vagas.resumo_motivos(vaga['motivos_match']))}</i>")
     if vaga.get("link_candidatura"):
         linhas.append(f'<a href="{escapar_html(vaga["link_candidatura"])}">Ver vaga</a>')
     return enviar_telegram("\n".join(linhas))
@@ -1640,8 +1660,7 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
                 techs = list(dict.fromkeys(techs_corpo + techs_g))
             else:
                 techs = techs_g or techs_corpo
-            score    = vaga_raw.get("score_match", 0) or 0
-            score_max = max(score_max, score)
+            score_ia = vaga_raw.get("score_match", 0) or 0
 
             # [FIX] Prioridade do link: 1) o que o Gemini já escolheu entre
             # as âncoras reais fornecidas; 2) casar o cargo desta vaga
@@ -1666,7 +1685,7 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
                 "salario":           vaga_raw.get("salario"),
                 "requisitos":        vaga_raw.get("requisitos", []),
                 "tecnologias":       techs,
-                "score_gemini":      score,
+                "score_ia":          score_ia,
                 "tipo_email":        vaga_raw.get("tipo_email",         "nova_vaga"),
                 "status_candidatura":vaga_raw.get("status_candidatura", "nova"),
                 "link_candidatura":  link,
@@ -1675,6 +1694,14 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
                 "status":            _status_do_email(vaga_raw.get("tipo_email"),
                                                       vaga_raw.get("status_candidatura")),
             }
+
+            # Score explicável: regras locais do perfil + score da IA (quando houver).
+            # É ele que decide label, push, follow-up e rascunho.
+            match = match_vagas.avaliar(vaga)
+            score = match_vagas.combinar(match["score"], score_ia)
+            vaga["score_gemini"] = score
+            vaga["motivos_match"] = match["motivos"]
+            score_max = max(score_max, score)
 
             # E-mail de acompanhamento de uma candidatura já conhecida →
             # atualiza a vaga existente em vez de criar uma duplicada.
@@ -1692,6 +1719,9 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
             tipo = vaga_raw.get("tipo_email", "nova_vaga")
             lk   = f" → {link[:50]}" if link else ""
             Log.ok(f"    {flag} [{tipo}] {vaga['cargo']} @ {vaga['empresa']} — score {score}%{lk}")
+            if match["motivos"]:
+                Log.info(f"        por quê: {match_vagas.resumo_motivos(match['motivos'])}"
+                         + (f" | IA {score_ia}%" if score_ia else ""))
 
             if not dry_run:
                 # Num digest o e-mail do recrutador não é confiável por vaga

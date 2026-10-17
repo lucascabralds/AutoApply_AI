@@ -47,6 +47,7 @@ O algoritmo monitora ativamente a conta do Gmail e realiza a extração e o proc
 | `calendario.py` | Vencimentos e agendamentos → eventos no Google Calendar (com lembrete). |
 | `notificador.py` | Envio de mensagens pelo Telegram. |
 | `seguranca.py` | Redação de OTPs e links de recuperação antes de gravar/enviar. |
+| `match_vagas.py` | Score de aderência da vaga ao perfil, explicável ("+50 área-alvo: dados", "-25 nível sênior"), combinado com o score da IA. |
 | `candidatura.py` | Rascunhos de candidatura no Gmail: carta gerada pela IA a partir do perfil + currículo anexado. |
 | `services/gmail/add_task.py` | Follow-ups de vagas no Google Tasks. |
 | `supabase/schema.sql` | Schema idempotente de todas as tabelas. |

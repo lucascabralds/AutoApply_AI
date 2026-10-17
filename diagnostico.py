@@ -120,7 +120,7 @@ def checar_supabase() -> list[Resultado]:
 
     res = []
     tabelas = {
-        "vagas_extraidas": "id, vaga_uid, empresa, score_match",
+        "vagas_extraidas": "id, vaga_uid, empresa, score_match, motivos_match",
         "certificados_portfolio": "id",
         "log_acessos_otp": "id",
         "despesas_domesticas": "id",
@@ -133,7 +133,7 @@ def checar_supabase() -> list[Resultado]:
             msg = str(e)
             if tabela == "vagas_extraidas" and ("vaga_uid" in msg or "PGRST204" in msg or "42703" in msg):
                 res.append(Resultado(f"Supabase: {tabela}", AVISO,
-                                     "sem as colunas da v3 — rode supabase/schema.sql no SQL Editor"))
+                                     "sem as colunas novas (vaga_uid / motivos_match) — rode supabase/schema.sql no SQL Editor"))
             else:
                 res.append(Resultado(f"Supabase: {tabela}", ERRO, f"{msg[:140]} — rode supabase/schema.sql"))
     return res

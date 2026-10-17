@@ -81,6 +81,7 @@ def ambiente(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "_CACHE_PATH", str(tmp_path / "cache.json"))
     monkeypatch.setattr(main, "_BUDGET_PATH", str(tmp_path / "budget.json"))
     monkeypatch.setattr(main, "_SCHEMA_VAGAS_V3", None)
+    monkeypatch.setattr(main, "_SCHEMA_VAGAS_MOTIVOS", None)
     monkeypatch.setattr(main.time, "sleep", lambda s: None)
     monkeypatch.setattr(main, "telegram_configurado", lambda: False)
     monkeypatch.setattr(main, "_status_ia", lambda: "ok")
@@ -121,6 +122,12 @@ def test_digest_vira_duas_vagas_com_links_corretos(ambiente):
     assert linhas["Analista de Dados Jr"]["links_candidatura"] == ["https://www.catho.com.br/vagas/analista-dados/2"]
     assert linhas["Desenvolvedor Python"]["tecnologias"] == ["python", "django"]
     assert linhas["Desenvolvedor Python"]["vaga_uid"] != linhas["Analista de Dados Jr"]["vaga_uid"]
+
+    # score final = regras do perfil + IA, com o porquê gravado junto
+    dev = linhas["Desenvolvedor Python"]
+    assert dev["score_ia"] == 85
+    assert any("cargo Python" in mot for mot in dev["motivos_match"])
+    assert dev["score_match"] >= 75
 
     # e-mail do próprio robô foi ignorado; o digest ganhou label de alta prioridade
     assert gmail.labels_aplicadas == {"m1": ["L_PAI", "L_ALTA"]}
