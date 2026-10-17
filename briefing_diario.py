@@ -434,7 +434,7 @@ def _formatar_vagas(vagas: list[dict]) -> tuple[str, str]:
             else:
                 links = links_raw or []
             link = links[0] if links else None
-            status = v.get("status_aplicacao", "nova")
+            status = v.get("status_aplicacao") or "nova"
 
             score_txt = f" {score}%" if score else ""
 

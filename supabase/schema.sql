@@ -36,6 +36,12 @@ alter table vagas_extraidas add column if not exists requisitos      jsonb defau
 alter table vagas_extraidas add column if not exists tipo_email      text;
 alter table vagas_extraidas add column if not exists data_email      text;
 alter table vagas_extraidas add column if not exists task_id         text;
+
+-- O pipeline não envia status_aplicacao no upsert de vaga nova (para uma vaga
+-- que reaparece num digest não voltar de "aplicada" para "nova") — então o
+-- padrão da coluna precisa existir também em tabelas criadas antes deste schema.
+alter table vagas_extraidas alter column status_aplicacao set default 'nova';
+update vagas_extraidas set status_aplicacao = 'nova' where status_aplicacao is null;
 -- v4: score explicável — score_match passa a ser o score final (regras do
 -- perfil em match_vagas.py + IA); score_ia guarda o que a IA deu e
 -- motivos_match o porquê de cada ponto ("+50 área-alvo: dados"...).

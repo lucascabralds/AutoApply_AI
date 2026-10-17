@@ -75,3 +75,8 @@ def test_briefing_mostra_aplicar_hoje_antes_das_vagas():
     # sem os parâmetros novos o briefing continua como antes
     texto_antigo, _ = b.montar_briefing([], [], [], [], [], [], 1)
     assert "APLICAR HOJE" not in texto_antigo
+
+
+def test_vaga_com_status_nulo_aparece_como_nova():
+    txt, _ = b._formatar_vagas([{"cargo": "Dev", "fonte": "catho", "status_aplicacao": None}])
+    assert "[nova]" in txt and "None" not in txt
