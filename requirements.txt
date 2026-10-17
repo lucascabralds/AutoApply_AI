@@ -1,0 +1,9 @@
+# AutoApply AI — dependências de execução
+google-api-python-client>=2.100
+google-auth>=2.23
+google-auth-httplib2>=0.1
+google-auth-oauthlib>=1.1
+python-dotenv>=1.0
+requests>=2.31
+beautifulsoup4>=4.12
+supabase>=2.0

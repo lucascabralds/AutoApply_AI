@@ -1,70 +1,74 @@
 """
 Módulo de Integração com Google Tasks - AutoApply_AI
 
-Este script é responsável por estabelecer a comunicação com a API do Google Tasks 
-utilizando autenticação OAuth 2.0. Ele permite a criação automatizada de tarefas 
-na conta do usuário.
+Cria tarefas de follow-up na lista padrão (@default) do Google Tasks:
+  - vagas de alta prioridade → "Candidatar: <cargo> @ <empresa>" com o link
+    e prazo para o dia seguinte
 
-Contexto no Projeto:
-Embora atualmente esteja configurado com uma tarefa de exemplo ("Fazer Janta"), 
-este módulo serve como base no projeto AutoApply_AI para automatizar lembretes 
-importantes (ex: agendar follow-ups de vagas aplicadas, lembretes de entrevistas 
-ou prazos de testes técnicos).
+O main.py chama criar_tarefa_vaga() automaticamente quando
+GOOGLE_TASKS_ENABLED=true no .env. A autenticação é a mesma do resto do
+projeto (google_auth.py) — na primeira vez com a opção ligada, o navegador
+abre de novo para autorizar o escopo do Tasks.
 
 Pré-requisitos:
-- Um arquivo 'credentials.json' válido (obtido via Google Cloud Console).
-- A API do Google Tasks precisa estar ativada no projeto do Google Cloud.
-- O primeiro uso abrirá o navegador para consentimento e gerará o 'token.json'.
+- A API do Google Tasks ativada no projeto do Google Cloud.
+- GOOGLE_TASKS_ENABLED=true no .env.
+
+Teste rápido (cria uma tarefa de exemplo):
+    python services/gmail/add_task.py
 """
 
-
+import datetime
 import os
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
+import sys
 
-# Escopo necessário para ler e escrever no Google Tasks
-SCOPES = ['https://www.googleapis.com/auth/tasks']
+from googleapiclient.errors import HttpError
 
-def adicionar_tarefa():
-    creds = None
-    
-    # O arquivo token.json armazena os tokens de acesso e atualização do usuário.
-    # Ele é criado automaticamente na primeira vez que você faz login.
-    if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-    
-    # Se não houver credenciais válidas disponíveis, permita que o usuário faça login.
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            # Requer um arquivo credentials.json obtido no Google Cloud Console
-            flow = InstalledAppFlow.from_client_secrets_file(
-                'credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0)
-        
-        # Salva as credenciais para a próxima execução do script
-        with open('token.json', 'w') as token:
-            token.write(creds.to_json())
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
+import google_auth  # noqa: E402
 
-    # Constrói o serviço de comunicação com a API do Google Tasks
-    service = build('tasks', 'v1', credentials=creds)
 
-    # Detalhes da tarefa que você solicitou
-    nova_tarefa = {
-        'title': 'Fazer Janta',
-        'notes': 'Adicionado automaticamente via script.'
-    }
+def construir_servico():
+    """Cliente do Google Tasks, ou None se a integração estiver desligada no .env."""
+    if not google_auth.TASKS_ENABLED:
+        return None
+    (service,) = google_auth.construir_servicos("tasks")
+    return service
 
+
+def criar_tarefa(service, titulo: str, notas: str = "", prazo: datetime.date | None = None) -> str | None:
+    """Insere uma tarefa na lista padrão. Retorna o id criado, ou None em erro."""
+    corpo = {"title": titulo[:1024], "notes": notas[:8000]}
+    if prazo:
+        # A API só considera a data; o horário é ignorado mas é obrigatório no formato.
+        corpo["due"] = f"{prazo.isoformat()}T00:00:00.000Z"
     try:
-        # Insere a tarefa na sua lista padrão (@default) do Google Tasks
-        resultado = service.tasks().insert(tasklist='@default', body=nova_tarefa).execute()
-        print(f"Tarefa '{resultado.get('title')}' adicionada com sucesso!")
-        print(f"ID da Tarefa: {resultado.get('id')}")
-    except Exception as e:
-        print(f"Ocorreu um erro ao adicionar a tarefa: {e}")
+        resultado = service.tasks().insert(tasklist="@default", body=corpo).execute()
+        return resultado.get("id")
+    except HttpError as e:
+        print(f"[WARN] Google Tasks recusou a tarefa '{titulo[:40]}': {e}")
+        return None
 
-if __name__ == '__main__':
-    adicionar_tarefa()
+
+def criar_tarefa_vaga(service, vaga: dict) -> str | None:
+    """Follow-up de candidatura para uma vaga de alta prioridade."""
+    empresa = vaga.get("empresa") or "empresa não identificada"
+    titulo = f"Candidatar: {vaga.get('cargo')} @ {empresa}"
+    notas = "\n".join(filter(None, [
+        f"Score de match: {vaga.get('score_gemini', 0)}%",
+        f"Modelo: {vaga.get('modelo_trabalho')}" if vaga.get("modelo_trabalho") else None,
+        f"Local: {vaga.get('local')}" if vaga.get("local") else None,
+        f"Link: {vaga.get('link_candidatura')}" if vaga.get("link_candidatura") else None,
+        "Criado automaticamente pelo AutoApply AI.",
+    ]))
+    amanha = datetime.date.today() + datetime.timedelta(days=1)
+    return criar_tarefa(service, titulo, notas, prazo=amanha)
+
+
+if __name__ == "__main__":
+    servico = construir_servico()
+    if not servico:
+        print("Defina GOOGLE_TASKS_ENABLED=true no .env para usar o Google Tasks.")
+        sys.exit(1)
+    tarefa_id = criar_tarefa(servico, "Teste AutoApply AI", "Adicionado automaticamente via script.")
+    print(f"Tarefa criada! ID: {tarefa_id}" if tarefa_id else "Falhou — veja o aviso acima.")

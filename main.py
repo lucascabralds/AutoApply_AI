@@ -56,18 +56,16 @@ from bs4 import BeautifulSoup
 # ---------------------------------------------------------------------------
 # Google / Gmail / Drive
 # ---------------------------------------------------------------------------
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload
 
-# ---------------------------------------------------------------------------
-# [FIX-1] Gemini — chamadas migradas para o gateway local Rota.IA
-# (http://localhost:8787/v1/chat/completions). Ver rota_ia_client.py.
-# ---------------------------------------------------------------------------
-from rota_ia_client import chamar_ia as _rota_ia_chamar_ia
+import google_auth
+from notificador import enviar_telegram, escapar_html, telegram_configurado
+from formatacao import empresa_conhecida, formatar_reais
+from seguranca import redigir_segredo
+from services.gmail.add_task import criar_tarefa_vaga
+import calendario
+import candidatura
 
 # ---------------------------------------------------------------------------
 # Supabase
@@ -101,13 +99,16 @@ load_dotenv()
 
 import hashlib
 
-_CACHE_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache_gemini.json")
-_BUDGET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gemini_budget.json")
+# Pasta do estado local (cache + budget). No Docker aponta para o volume /app/dados.
+_DADOS_DIR   = os.getenv("AUTOAPPLY_DADOS_DIR") or os.path.dirname(os.path.abspath(__file__))
+_CACHE_PATH  = os.path.join(_DADOS_DIR, "cache_gemini.json")
+_BUDGET_PATH = os.path.join(_DADOS_DIR, "gemini_budget.json")
 
 _BUDGET_LIMITE = {
     "vagas":   int(os.getenv("GEMINI_BUDGET_VAGAS",   "40")),
     "geral":   int(os.getenv("GEMINI_BUDGET_GERAL",   "10")),
     "alertas": int(os.getenv("GEMINI_BUDGET_ALERTAS", "10")),
+    "cartas":  int(os.getenv("GEMINI_BUDGET_CARTAS",  "5")),
 }
 
 # Carrega cache em memória uma vez por execução
@@ -146,7 +147,7 @@ def _carregar_budget() -> dict:
                 return dados
     except Exception:
         pass
-    return {"data": hoje, "vagas": 0, "geral": 0, "alertas": 0}
+    return {"data": hoje, "vagas": 0, "geral": 0, "alertas": 0, "cartas": 0}
 
 def _salvar_budget(budget: dict) -> None:
     try:
@@ -158,8 +159,17 @@ def _salvar_budget(budget: dict) -> None:
 _GEMINI_BUDGET: dict = _carregar_budget()
 
 
+def _virar_dia_do_budget() -> None:
+    """Zera os contadores quando o dia muda (importa no modo --intervalo)."""
+    hoje = datetime.date.today().isoformat()
+    if _GEMINI_BUDGET.get("data") != hoje:
+        _GEMINI_BUDGET.clear()
+        _GEMINI_BUDGET.update({"data": hoje, "vagas": 0, "geral": 0, "alertas": 0, "cartas": 0})
+
+
 def _tem_budget(modulo: str) -> bool:
     """Retorna True se ainda há chamadas disponíveis para este módulo hoje."""
+    _virar_dia_do_budget()
     return _GEMINI_BUDGET.get(modulo, 0) < _BUDGET_LIMITE.get(modulo, 10)
 
 def _consumir_budget(modulo: str) -> None:
@@ -173,23 +183,25 @@ def _status_budget() -> str:
     return (
         f"vagas {b.get('vagas',0)}/{lim['vagas']} | "
         f"geral {b.get('geral',0)}/{lim['geral']} | "
-        f"alertas {b.get('alertas',0)}/{lim['alertas']}"
+        f"alertas {b.get('alertas',0)}/{lim['alertas']} | "
+        f"cartas {b.get('cartas',0)}/{lim['cartas']}"
     )
 
 # ===========================================================================
 # CONFIGURAÇÃO GLOBAL
 # ===========================================================================
 
-# Gmail: escopo modify é obrigatório para criar/aplicar labels
-# Drive: scope para upload de arquivos
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/drive.file",   # upload no Drive
-]
+# Escopos, token.json e credentials.json ficam centralizados em google_auth.py
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-_BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
-TOKEN_PATH       = os.getenv("GMAIL_TOKEN_PATH",       os.path.join(_BASE_DIR, "token.json"))
-CREDENTIALS_PATH = os.getenv("GMAIL_CREDENTIALS_PATH", os.path.join(_BASE_DIR, "credentials.json"))
+# Alertas: só notifica no Telegram códigos de e-mails com até N minutos
+# (um OTP de ontem já expirou e só faria barulho no celular).
+OTP_MAX_IDADE_MIN = int(os.getenv("OTP_MAX_IDADE_MIN", "15"))
+# Vagas: score mínimo para virar notificação no Telegram
+SCORE_NOTIFICAR_VAGA = int(os.getenv("SCORE_NOTIFICAR_VAGA", "75"))
+
+# Máximo de e-mails lidos por módulo em cada execução
+LIMITE_EMAILS = int(os.getenv("LIMITE_EMAILS_POR_MODULO", "100"))
 
 PASTA_CERTIFICADOS = os.getenv("CERTIFICADOS_LOCAL", os.path.join(_BASE_DIR, "certificados"))
 DRIVE_FOLDER_ID    = os.getenv("DRIVE_FOLDER_ID", None)  # ID da pasta no Drive (opcional)
@@ -197,8 +209,6 @@ DRIVE_FOLDER_ID    = os.getenv("DRIVE_FOLDER_ID", None)  # ID da pasta no Drive 
 # [FIX-6] Remove barra final da URL do Supabase
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
@@ -215,6 +225,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 #   AutoApply/Geral/Agendamento       confirmações de agendamento, reservas
 #   AutoApply/Geral/Financeiro        cobranças, faturas, recibos
 #   AutoApply/Geral/Servicos          assinaturas, apps, notificações diversas
+#   AutoApply/Geral/Veiculo           Detran, IPVA, licenciamento, multas, CNH
 #
 # Regra de isolamento: cada módulo chama _aplicar_labels() apenas com
 # as chaves do SEU domínio. Nenhum módulo toca em labels de outro.
@@ -241,7 +252,14 @@ LABEL_TREE = {
     "geral_financeiro":   {"nome": "AutoApply/Geral/Financeiro",         "cor_bg": "#666666", "cor_txt": "#ffffff"},
     "geral_comunicado":   {"nome": "AutoApply/Geral/Comunicado",         "cor_bg": "#4a86e8", "cor_txt": "#ffffff"},
     "geral_servicos":     {"nome": "AutoApply/Geral/Servicos",           "cor_bg": "#cccccc", "cor_txt": "#000000"},
+    "geral_veiculo":      {"nome": "AutoApply/Geral/Veiculo",            "cor_bg": "#ffad47", "cor_txt": "#000000"},
 }
+
+# Filtro de busca que exclui e-mails já etiquetados por qualquer módulo.
+# Cada módulo aplica sempre a label pai + a sub-label, então basta excluir os pais.
+_QUERY_JA_PROCESSADO = " ".join(
+    f"-label:{LABEL_TREE[k]['nome']}" for k in ("vagas_pai", "cert_pai", "alerta_pai", "geral_pai")
+)
 
 # Ordem de criação: pais antes dos filhos (obrigatório pela Gmail API)
 _LABEL_ORDEM = [
@@ -249,25 +267,8 @@ _LABEL_ORDEM = [
     "cert_pai",    "cert_extraido", "cert_pendente",
     "alerta_pai",  "alerta_otp",    "alerta_recuperacao",
     "geral_pai",   "geral_agendamento", "geral_financeiro",
-    "geral_comunicado", "geral_servicos",
+    "geral_comunicado", "geral_servicos", "geral_veiculo",
 ]
-
-# Paleta de cores válidas do Gmail (backgroundColor)
-_PALETA_GMAIL = {
-    "#000000","#434343","#666666","#999999","#cccccc","#efefef","#f3f3f3","#ffffff",
-    "#fb4c2f","#ffad47","#fad165","#16a765","#43d692","#4a86e8","#a479e2","#f691b3",
-    "#f6c5be","#ffe6c7","#fef1d1","#b9e4d0","#c6f3de","#c9daf8","#e4d7f5","#fcdee8",
-    "#efa093","#ffd6a2","#fce8b3","#89d3b2","#a0eac9","#a4c2f4","#d0bcf1","#fbc8d9",
-    "#e66550","#ffbc6b","#fcda83","#44b984","#68dfa9","#6d9eeb","#b694e8","#f7a7c0",
-    "#cc3a21","#eaa041","#f2c960","#149e60","#3dc789","#3c78d8","#8e63ce","#e07798",
-    "#ac2b16","#cf8933","#d5ae49","#0b804b","#2a9c68","#285bac","#653e9b","#b65775",
-    "#822111","#a46a21","#aa8831",""#076239","#1a764d","#1c4587","#41236d","#83334c",
-    "#464646","#e7e7e7","#0d3472","#b6cff5","#0d3b44","#98d7e4","#3d188e","#e3d7ff",
-    "#711a36","#fbd3e0","#8a1c0a","#f2b2a8","#7a2e0b","#ffc8af","#7a4706","#ffdeb5",
-    "#594c05","#fbe983","#684e07","#fdedc1","#0b4f30","#b3efd3","#04502e","#a2dcc1",
-    "#c2c2c2","#4986e7","#2da2bb","#b99aff","#994a64","#f691b2","#ff7537","#ffad46",
-    "#662e37","#ebdbde","#cca6ac","#094228","#42d692","#16a765",
-}
 
 # ---------------------------------------------------------------------------
 # [FIX] Regra de exclusão — e-mails gerados pelo PRÓPRIO AutoApply AI
@@ -419,47 +420,9 @@ class Log:
 
 def autenticar_google() -> tuple:
     """
-    OAuth2 unificado para Gmail (modify) + Drive (file upload).
-    Retorna (gmail_service, drive_service).
+    OAuth2 unificado (ver google_auth.py). Retorna (gmail_service, drive_service).
     """
-    if not os.path.exists(CREDENTIALS_PATH):
-        raise FileNotFoundError(
-            f"credentials.json não encontrado em: {CREDENTIALS_PATH}\n"
-            "Baixe em: console.cloud.google.com → APIs & Services → Credentials\n"
-            "Certifique-se de habilitar Gmail API e Google Drive API no projeto."
-        )
-
-    creds = None
-    if os.path.exists(TOKEN_PATH):
-        try:
-            creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-        except Exception as e:
-            Log.warn(f"Token inválido, será recriado: {e}")
-            os.remove(TOKEN_PATH)
-            creds = None
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            Log.info("Token expirado — fazendo refresh...")
-            try:
-                creds.refresh(Request())
-                Log.ok("Token renovado.")
-            except Exception as e:
-                Log.warn(f"Refresh falhou ({e}), iniciando novo fluxo OAuth...")
-                creds = None
-
-        if not creds:
-            Log.info("Abrindo navegador para autenticação OAuth2 (Gmail + Drive)...")
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
-            creds = flow.run_local_server(port=0)
-            Log.ok("Autenticação concluída.")
-
-        with open(TOKEN_PATH, "w") as fh:
-            fh.write(creds.to_json())
-        Log.info(f"Token salvo em: {TOKEN_PATH}")
-
-    gmail_service = build("gmail", "v1", credentials=creds)
-    drive_service = build("drive", "v3", credentials=creds)
+    gmail_service, drive_service = google_auth.construir_servicos("gmail", "drive", log=Log.info)
     Log.ok("Gmail e Drive autenticados.")
     return gmail_service, drive_service
 
@@ -625,6 +588,63 @@ def extrair_corpo(payload: dict) -> str:
 def _header(headers: list, name: str, default: str = "") -> str:
     nl = name.lower()
     return next((h["value"] for h in headers if h["name"].lower() == nl), default)
+
+
+def _iterar_partes(payload: dict):
+    """Percorre recursivamente todas as partes MIME (multipart/mixed → alternative → ...)."""
+    for parte in payload.get("parts", []) or []:
+        yield parte
+        yield from _iterar_partes(parte)
+
+
+def _eh_inline(parte: dict) -> bool:
+    """
+    Imagem embutida no corpo (logo, assinatura). A Content-Disposition manda:
+    o Gmail põe Content-ID até em anexos de verdade ("attachment"), então o
+    Content-ID só decide quando não há disposition.
+    """
+    headers = {h["name"].lower(): h["value"].lower() for h in parte.get("headers", [])}
+    disposicao = headers.get("content-disposition", "").strip()
+    if disposicao:
+        return disposicao.startswith("inline")
+    return "content-id" in headers
+
+
+def _anexos_certificado(partes: list[dict]) -> list[dict]:
+    """
+    Anexos candidatos a certificado, na ordem de preferência: PDFs, depois
+    imagens/arquivos anexados de verdade. Imagens inline (logo do e-mail
+    dentro de multipart/related) ficam de fora — a busca em profundidade
+    chegava nelas antes do PDF e a logo ia para o Drive como "certificado".
+    """
+    anexos = [p for p in partes if p.get("filename")]
+
+    def prioridade(p):
+        mime = p.get("mimeType", "")
+        if mime == "application/pdf" or p["filename"].lower().endswith(".pdf"):
+            return 0
+        return 1
+
+    return sorted((p for p in anexos if not _eh_inline(p)), key=prioridade)
+
+
+def _listar_mensagens(service, query: str, limite: int) -> list[dict]:
+    """
+    messages.list com paginação. A API devolve no máximo uma página por
+    chamada — sem seguir o nextPageToken, e-mails além da 1ª página eram
+    silenciosamente ignorados em janelas maiores (--dias 7, por exemplo).
+    """
+    msgs: list[dict] = []
+    token = None
+    while len(msgs) < limite:
+        resp = service.users().messages().list(
+            userId="me", q=query, maxResults=min(100, limite - len(msgs)), pageToken=token,
+        ).execute()
+        msgs.extend(resp.get("messages", []))
+        token = resp.get("nextPageToken")
+        if not token:
+            break
+    return msgs[:limite]
 
 
 def _detectar_fonte(remetente: str) -> str:
@@ -824,32 +844,6 @@ def _extrair_link_candidatura(corpo: str, remetente: str = "", ancoras: list[dic
     return candidatos[0] if candidatos else None
 
 
-# [FIX-3] Classificação de e-mail como vaga ou não-vaga
-def _classificar_email(assunto: str, corpo: str, fonte: str) -> str:
-    """
-    Retorna 'vaga', 'nao_vaga' ou 'ignorar'.
-    
-    - Fontes conhecidas (indeed, catho…): sempre 'vaga'
-    - Fonte 'outro': verifica palavras de exclusão e inclusão
-    """
-    if fonte != "outro":
-        return "vaga"
-
-    texto = (assunto + " " + corpo[:600]).lower()
-
-    # Palavras de exclusão têm prioridade
-    for p in PALAVRAS_NAO_VAGA:
-        if p in texto:
-            return "nao_vaga"
-
-    # Verifica se tem palavras de vaga
-    for p in PALAVRAS_VAGA:
-        if p in texto:
-            return "vaga"
-
-    return "ignorar"
-
-
 # ===========================================================================
 # 4. SUPABASE
 # ===========================================================================
@@ -882,25 +876,151 @@ def _sb_upsert_insert(sb: Client, tabela: str, registro: dict, conflict_col: str
         return False
 
 
+def _vaga_uid(email_id: str, cargo: str | None, empresa: str | None) -> str:
+    """
+    Identificador estável de UMA vaga: mesmo e-mail + mesmo cargo + mesma
+    empresa → mesmo uid. Permite upsert por vaga (um digest com 10 vagas
+    vira 10 linhas) sem duplicar quando o e-mail é processado de novo.
+    """
+    chave = "|".join([email_id or "", _normalizar_para_match(cargo or ""), _normalizar_para_match(empresa or "")])
+    return hashlib.sha1(chave.encode("utf-8")).hexdigest()[:20]
+
+
+# None = ainda não testado nesta execução; False = banco sem a migração v3
+_SCHEMA_VAGAS_V3: bool | None = None
+
+
+def _erro_de_schema(exc: Exception) -> bool:
+    """
+    Só erros que indicam banco SEM a migração v3: coluna inexistente
+    (PGRST204 / 42703) ou falta do índice único de vaga_uid (42P10).
+    Erros de dado ("null value in column", "value too long for column")
+    não podem desligar o formato novo para o resto da execução.
+    """
+    msg = str(exc).lower()
+    return any(p in msg for p in (
+        "pgrst204", "schema cache", "42703", "42p10",
+        "no unique or exclusion constraint",
+    ))
+
+
 def salvar_vaga(sb: Client | None, vaga: dict, dry_run: bool = False) -> bool:
+    global _SCHEMA_VAGAS_V3
     if dry_run:
         Log.info(f"  [DRY-RUN] vagas_extraidas: {vaga.get('cargo')} @ {vaga.get('empresa')}")
         return True
     if not sb:
         return False
-    # Mapeia para o schema real do Supabase (imagem do schema)
-    registro = {
+
+    links = [vaga["link_candidatura"]] if vaga.get("link_candidatura") else []
+
+    if _SCHEMA_VAGAS_V3 is not False:
+        registro = {
+            "vaga_uid":          _vaga_uid(vaga.get("email_id"), vaga.get("cargo"), vaga.get("empresa")),
+            "gmail_message_id":  vaga.get("email_id"),
+            "cargo":             vaga.get("cargo"),
+            "empresa":           vaga.get("empresa"),
+            "local":             vaga.get("local"),
+            "modelo_trabalho":   vaga.get("modelo_trabalho"),
+            "salario":           vaga.get("salario"),
+            "score_match":       int(vaga.get("score_gemini") or 0),
+            "fonte":             vaga.get("fonte"),
+            "tecnologias":       vaga.get("tecnologias") or [],
+            "requisitos":        vaga.get("requisitos") or [],
+            "links_candidatura": links,
+            "tipo_email":        vaga.get("tipo_email"),
+            "data_email":        vaga.get("data_email"),
+            "status_aplicacao":  vaga.get("status", "nova"),
+        }
+        try:
+            sb.table("vagas_extraidas").upsert(registro, on_conflict="vaga_uid").execute()
+            _SCHEMA_VAGAS_V3 = True
+            return True
+        except Exception as e:
+            if _SCHEMA_VAGAS_V3 is None and _erro_de_schema(e):
+                _SCHEMA_VAGAS_V3 = False
+                Log.warn(
+                    "  Tabela vagas_extraidas sem as colunas novas — rode supabase/schema.sql "
+                    "no SQL Editor do Supabase. Usando o formato antigo (1 linha por e-mail)."
+                )
+            else:
+                Log.warn(f"  Supabase 'vagas_extraidas' falhou: {e}")
+                return False
+
+    # Formato antigo (antes da migração v3)
+    registro_legado = {
         "gmail_message_id":  vaga.get("email_id"),
         "cargo":             vaga.get("cargo"),
         "fonte":             vaga.get("fonte"),
-        "tecnologias":       vaga.get("tecnologias"),        # jsonb (já é string JSON)
-        "links_candidatura": json.dumps(                     # jsonb — array de links
-            [vaga["link_candidatura"]] if vaga.get("link_candidatura") else [],
-            ensure_ascii=False,
-        ),
+        "tecnologias":       json.dumps(vaga.get("tecnologias") or [], ensure_ascii=False),
+        "links_candidatura": json.dumps(links, ensure_ascii=False),
         "status_aplicacao":  vaga.get("status", "nova"),
     }
-    return _sb_upsert_insert(sb, "vagas_extraidas", registro, "gmail_message_id")
+    return _sb_upsert_insert(sb, "vagas_extraidas", registro_legado, "gmail_message_id")
+
+
+# Funil de candidatura — o status de uma vaga só avança, nunca regride
+# (um "retorno" atrasado não pode desfazer um "avançou de fase").
+_ORDEM_STATUS = {"nova": 0, "aplicada": 1, "em_processo": 2, "reprovada": 3, "aprovada": 3}
+
+
+def _status_do_email(tipo_email: str | None, status_candidatura: str | None) -> str:
+    """Traduz o tipo de e-mail classificado pela IA para o status da vaga no banco."""
+    if tipo_email == "candidatura_enviada":
+        return "aplicada"
+    if tipo_email == "avanco_fase":
+        return "em_processo"
+    if tipo_email == "retorno":
+        return "reprovada" if status_candidatura == "reprovado" else "em_processo"
+    return "nova"
+
+
+def atualizar_status_vaga(sb: Client | None, vaga: dict, novo_status: str) -> bool:
+    """
+    E-mails de acompanhamento ("sua candidatura foi enviada", "você avançou
+    de fase"...) não são vagas novas: procura a vaga já salva com a mesma
+    empresa e cargo parecido e só avança o status_aplicacao dela.
+    Retorna True se encontrou a vaga (mesmo que o status já estivesse à frente).
+    """
+    if not sb or _SCHEMA_VAGAS_V3 is False:
+        return False
+    empresa, cargo = vaga.get("empresa"), vaga.get("cargo") or ""
+    if not empresa_conhecida(empresa):
+        return False
+    padrao = re.sub(r"[%_*,()]", " ", empresa).strip()
+    try:
+        res = (
+            sb.table("vagas_extraidas")
+            .select("id, cargo, empresa, status_aplicacao")
+            .ilike("empresa", f"%{padrao}%")
+            .order("created_at", desc=True)
+            .limit(50)
+            .execute()
+        )
+    except Exception as e:
+        Log.warn(f"  Busca da vaga para atualizar status falhou: {e}")
+        return False
+
+    def _mesmo_cargo(outro: str | None) -> bool:
+        a, b = _normalizar_para_match(cargo), _normalizar_para_match(outro)
+        return bool(a and b) and (a in b or b in a)
+
+    candidatas = [r for r in (res.data or []) if _mesmo_cargo(r.get("cargo"))]
+    if not candidatas:
+        return False
+
+    linha = candidatas[0]   # a mais recente
+    atual = linha.get("status_aplicacao") or "nova"
+    if _ORDEM_STATUS.get(novo_status, 0) <= _ORDEM_STATUS.get(atual, 0):
+        Log.info(f"    ↺ {linha['cargo']} @ {linha['empresa']} já está em '{atual}'")
+        return True
+    try:
+        sb.table("vagas_extraidas").update({"status_aplicacao": novo_status}).eq("id", linha["id"]).execute()
+    except Exception as e:
+        Log.warn(f"  Atualização de status falhou: {e}")
+        return False
+    Log.ok(f"    ↗ {linha['cargo']} @ {linha['empresa']}: {atual} → {novo_status}")
+    return True
 
 
 def salvar_certificado(sb: Client | None, cert: dict, dry_run: bool = False) -> bool:
@@ -920,17 +1040,26 @@ def salvar_certificado(sb: Client | None, cert: dict, dry_run: bool = False) -> 
     return _sb_upsert_insert(sb, "certificados_portfolio", registro, "gmail_message_id")
 
 
+def _idade_minutos(detalhe: dict) -> float | None:
+    """Minutos desde que o Gmail recebeu a mensagem (campo internalDate, em ms)."""
+    try:
+        recebido = int(detalhe["internalDate"]) / 1000
+    except (KeyError, TypeError, ValueError):
+        return None
+    return (time.time() - recebido) / 60
+
+
 def salvar_alerta(sb: Client | None, alerta: dict, dry_run: bool = False) -> bool:
     if dry_run:
         Log.info(f"  [DRY-RUN] log_acessos_otp: {alerta.get('plataforma')}")
         return True
     if not sb:
         return False
-    # Schema: log_acessos_otp
+    # Schema: log_acessos_otp — o segredo em si nunca vai para o banco
     registro = {
         "plataforma":      alerta.get("plataforma"),
         "tipo_alerta":     alerta.get("tipo_solicitacao"),
-        "codigo_extraido": alerta.get("codigo_ou_link"),
+        "codigo_extraido": redigir_segredo(alerta.get("codigo_ou_link")),
     }
     try:
         sb.table("log_acessos_otp").insert(registro).execute()
@@ -950,8 +1079,8 @@ def salvar_email_geral(sb: Client | None, registro_raw: dict, dry_run: bool = Fa
 
     categoria = registro_raw.get("categoria", "servicos")
 
-    # ── Financeiro → despesas_domesticas ────────────────────────────────────
-    if categoria == "financeiro":
+    # ── Financeiro e veículo (IPVA, multa...) → despesas_domesticas ────────
+    if categoria in ("financeiro", "veiculo"):
         # Só inclui campos que têm valor — evita NOT NULL violation
         # O schema tem: gmail_message_id, estabelecimento, categoria,
         #               valor (nullable), data_despesa (nullable), origem_recurso
@@ -962,13 +1091,13 @@ def salvar_email_geral(sb: Client | None, registro_raw: dict, dry_run: bool = Fa
                 or registro_raw.get("remetente", "").split("<")[0].strip()
                 or "Desconhecido"
             ),
-            "categoria":        registro_raw.get("subcategoria", "boleto_fatura"),
+            "categoria":        registro_raw.get("subcategoria") or "boleto_fatura",
             "origem_recurso":   "email",
         }
-        # Só adiciona valor se não for None/vazio
-        valor_raw = registro_raw.get("valor")
-        if valor_raw:
-            registro["valor"] = valor_raw
+        # Só adiciona valor se for um número reconhecível ("R$ 1.234,56" → 1234.56)
+        valor = _parsear_valor(registro_raw.get("valor"))
+        if valor is not None:
+            registro["valor"] = valor
 
         # Só adiciona data_despesa se não for None/vazio
         data_raw = registro_raw.get("data_evento") or registro_raw.get("data_despesa")
@@ -983,6 +1112,39 @@ def salvar_email_geral(sb: Client | None, registro_raw: dict, dry_run: bool = Fa
     # ── Comunicado → sem tabela dedicada ainda, label suficiente ────────────
     # (agendamento, comunicado, servicos)
     return True
+
+
+def _parsear_valor(texto) -> float | None:
+    """
+    Converte valores como 'R$ 1.234,56', '49,90', 'USD 12.50' ou 49.9 em float.
+    Retorna None quando não há número reconhecível.
+    """
+    if texto is None or isinstance(texto, bool):
+        return None
+    if isinstance(texto, (int, float)):
+        return float(texto)
+    texto = str(texto)
+    # "3x de R$ 49,90" → o valor é o que vem depois do símbolo da moeda
+    moeda = re.search(r"(?:R\$|US\$|\$|€|USD|BRL)\s*(\d[\d.,]*)", texto, re.IGNORECASE)
+    m = moeda or re.search(r"\d[\d.,]*", texto)
+    if not m:
+        return None
+    num = (moeda.group(1) if moeda else m.group(0)).rstrip(".,")
+    if "," in num and "." in num:
+        # o separador que aparece por último é o decimal
+        if num.rfind(",") > num.rfind("."):
+            num = num.replace(".", "").replace(",", ".")
+        else:
+            num = num.replace(",", "")
+    elif "," in num:
+        inteiro, _, dec = num.rpartition(",")
+        num = f"{inteiro.replace(',', '')}.{dec}" if len(dec) <= 2 else num.replace(",", "")
+    elif num.count(".") > 1 or (num.count(".") == 1 and len(num.rpartition(".")[2]) == 3):
+        num = num.replace(".", "")   # 1.234 ou 1.234.567 → milhar
+    try:
+        return round(float(num), 2)
+    except ValueError:
+        return None
 
 
 def _parsear_data(texto: str) -> str | None:
@@ -1066,177 +1228,65 @@ def _nome_seguro(texto: str, ext: str = "") -> str:
 
 
 # ===========================================================================
-# 6. GEMINI — importado do módulo dedicado
+# 6. IA — prompts e parse de JSON moram em gemini_service.py
 # ===========================================================================
-# Toda a lógica de IA está em gemini_service.py.
-# Aqui apenas importamos e criamos wrappers de compatibilidade.
+# Aqui ficam só as camadas de economia em volta da IA:
+#   cache local (por gmail_message_id) → heurística grátis → budget diário.
+# As funções de gemini_service nunca levantam exceção: devolvem {} / [].
 
-try:
-    from gemini_service import (
-        classificar_email      as _gs_classificar,
-        extrair_vagas          as _gs_extrair_vagas,
-        analisar_acesso        as _gs_analisar_acesso,
-        classificar_email_geral as _gs_classificar_geral,
-    )
-    _GEMINI_SERVICE_OK = True
-    Log.ok("gemini_service.py carregado.")
-except ImportError as _e:
-    Log.warn(f"gemini_service.py não encontrado ({_e}) — usando fallback interno.")
-    _GEMINI_SERVICE_OK = False
-
-
-# ── Fallback: usado apenas se gemini_service.py não estiver disponível ──
-# Todas as requisições passam pelo gateway local Rota.IA (rota_ia_client.py),
-# que fala o formato OpenAI-compatible em http://localhost:8787/v1/chat/completions.
-
-def _gerar_gemini(prompt: str, max_tentativas: int = 3) -> str:
-    return _rota_ia_chamar_ia(prompt, max_tentativas=max_tentativas)
-
-
-# ---------------------------------------------------------------------------
-# [FIX] Parse robusto de JSON vindo da IA.
-#
-# O erro de parse acontecia por dois motivos:
-#   1) A IA envolve a resposta em cercas de markdown (```json ... ```) ou
-#      adiciona texto solto antes/depois ("Aqui está o resultado:").
-#   2) A resposta é cortada no meio (limite de tokens), deixando chaves/
-#      colchetes sem fechar — json.loads falha e a vaga/e-mail inteiro
-#      era descartado, mesmo quando dava para aproveitar parte dos dados.
-# ---------------------------------------------------------------------------
-
-INSTRUCAO_JSON_PURO = (
-    "\n\nFORMATO DE RESPOSTA — MUITO IMPORTANTE:\n"
-    "Responda em RAW JSON — comece a resposta direto com { ou [ e termine "
-    "com } ou ]. NÃO use crases (```), NÃO use ```json, NÃO escreva nenhum "
-    "texto antes ou depois do JSON (sem \"aqui está\", sem explicações). "
-    "Se a lista for longa, prefira encurtar textos (ex.: descrição/resumo) "
-    "a deixar o JSON incompleto — a resposta precisa terminar fechada."
+from rota_ia_client import gateway_disponivel
+from gemini_service import status_ultima_chamada as _status_ia
+from gemini_service import (
+    classificar_email       as _gs_classificar,
+    extrair_vagas           as _gs_extrair_vagas,
+    analisar_acesso         as _gs_analisar_acesso,
+    classificar_email_geral as _gs_classificar_geral,
+    gerar_carta_apresentacao as _gs_gerar_carta,
 )
 
+_PALAVRAS_AGENDAMENTO = ["agendamento", "confirmado", "reserva", "horário", "consulta", "appointment"]
+_PALAVRAS_FINANCEIRO  = ["fatura", "boleto", "cobrança", "pagamento", "nota fiscal", "pix", "débito", "crédito"]
 
-def _tentar_reparar_json_truncado(texto: str):
-    """
-    Tenta recuperar dados de um JSON cortado no meio (resposta truncada
-    pelo limite de tokens). Encontra os pontos onde a estrutura ainda
-    estava balanceada até aquele momento, fecha as chaves/colchetes
-    pendentes e tenta json.loads — dos cortes mais tardios (menos perda
-    de dados) para os mais cedo, até um deles parsear com sucesso.
-    Retorna o objeto parseado, ou None se não for recuperável.
-    """
-    if not texto or texto[0] not in "{[":
+
+def _cache_get(tipo: str, msg_id: str, tipo_python: type):
+    """Retorna a resposta cacheada (se existir e tiver o tipo esperado) ou None."""
+    if not msg_id:
         return None
-
-    # Localiza todas as vírgulas "de verdade" (fora de strings)
-    posicoes_virgula = []
-    dentro_string = False
-    escape = False
-    for i, ch in enumerate(texto):
-        if escape:
-            escape = False
-            continue
-        if ch == "\\" and dentro_string:
-            escape = True
-            continue
-        if ch == '"':
-            dentro_string = not dentro_string
-            continue
-        if not dentro_string and ch == ",":
-            posicoes_virgula.append(i)
-
-    def _pilha_ate(pos: int) -> list:
-        pilha = []
-        dentro = False
-        esc = False
-        for ch in texto[:pos]:
-            if esc:
-                esc = False
-                continue
-            if ch == "\\" and dentro:
-                esc = True
-                continue
-            if ch == '"':
-                dentro = not dentro
-                continue
-            if dentro:
-                continue
-            if ch in "{[":
-                pilha.append(ch)
-            elif ch in "}]" and pilha:
-                pilha.pop()
-        return pilha
-
-    fechamentos = {"{": "}", "[": "]"}
-    for corte in reversed(posicoes_virgula):
-        pilha = _pilha_ate(corte)
-        if not pilha:
-            continue
-        sufixo = "".join(fechamentos[c] for c in reversed(pilha))
-        try:
-            return json.loads(texto[:corte] + sufixo)
-        except json.JSONDecodeError:
-            continue
-    return None
+    valor = _GEMINI_CACHE.get(_cache_key(tipo, msg_id))
+    return valor if isinstance(valor, tipo_python) else None
 
 
-def _limpar_e_parsear_json(raw: str):
+def _cache_set(tipo: str, msg_id: str, valor, permitir_vazio: bool = False) -> None:
+    if msg_id and (valor or (permitir_vazio and valor is not None)):
+        _GEMINI_CACHE[_cache_key(tipo, msg_id)] = valor
+        _salvar_cache(_GEMINI_CACHE)
+
+
+# E-mails que não deu para classificar agora (IA fora do ar / falhou). O
+# módulo de gerais não os etiqueta, para o de vagas tentar de novo depois.
+_PENDENTES_IA: set[str] = set()
+
+# Uma falha da IA num e-mail deixa ele para a próxima execução — mas só
+# algumas vezes: se a falha for permanente (chave errada, prompt rejeitado,
+# resposta sempre ilegível) o e-mail cai para a heurística em vez de ser
+# retentado para sempre e sumir da janela de busca sem nunca ser salvo.
+MAX_TENTATIVAS_IA = int(os.getenv("MAX_TENTATIVAS_IA", "3"))
+
+
+def _pode_retentar(tipo: str, msg_id: str) -> bool:
     """
-    Limpa a string bruta da IA (remove cercas de markdown, isola o maior
-    bloco JSON válido descartando prosa ao redor, remove vírgulas soltas)
-    e só então roda json.loads — com uma última tentativa de reparo caso
-    a resposta tenha sido cortada. Nunca levanta exceção: retorna {} se
-    não for recuperável de jeito nenhum.
+    Registra mais uma falha da IA para (tipo, e-mail). True enquanto vale
+    deixar para depois; False quando já falhou MAX_TENTATIVAS_IA vezes
+    ou o gateway está pausado e o e-mail não tem id.
     """
-    if not raw:
-        return {}
+    if not msg_id:
+        return False
+    chave = _cache_key(f"falhas_{tipo}", msg_id)
+    falhas = int(_GEMINI_CACHE.get(chave, 0)) + 1
+    _GEMINI_CACHE[chave] = falhas
+    _salvar_cache(_GEMINI_CACHE)
+    return falhas < MAX_TENTATIVAS_IA
 
-    texto = raw.strip()
-    texto = re.sub(r"```(?:json)?\s*", "", texto, flags=re.IGNORECASE)
-    texto = texto.replace("```", "").strip()
-
-    # Isola do primeiro '{'/'[' ao último '}'/']' — descarta qualquer
-    # texto explicativo que a IA tenha colocado antes/depois do JSON.
-    inicio = next((i for i, c in enumerate(texto) if c in "{["), None)
-    if inicio is not None:
-        fecha = "}" if texto[inicio] == "{" else "]"
-        fim = texto.rfind(fecha)
-        if fim != -1 and fim > inicio:
-            texto = texto[inicio:fim + 1]
-
-    try:
-        return json.loads(texto)
-    except json.JSONDecodeError:
-        pass
-
-    # Remove vírgulas soltas antes de } ou ] (erro comum do modelo)
-    texto_sem_virgula_solta = re.sub(r",\s*([}\]])", r"\1", texto)
-    try:
-        return json.loads(texto_sem_virgula_solta)
-    except json.JSONDecodeError:
-        pass
-
-    # Última tentativa: resposta truncada — recupera o que der
-    reparado = _tentar_reparar_json_truncado(texto_sem_virgula_solta)
-    if reparado is not None:
-        Log.warn("  ⚠ JSON da IA veio truncado — dados parciais recuperados")
-        return reparado
-
-    Log.warn(f"  Gemini JSON inválido (irrecuperável): {raw[:80]}...")
-    return {}
-
-
-def _parse_gemini_json(raw: str, esperado_dict: bool = True) -> dict:
-    parsed = _limpar_e_parsear_json(raw)
-    if isinstance(parsed, dict):
-        return parsed
-    if isinstance(parsed, list):
-        for item in parsed:
-            if isinstance(item, dict):
-                return item
-        return {}
-    return {}
-
-
-# ── Funções públicas usadas nos módulos ─────────────────────────────────────
 
 def classificar_email_pipeline(assunto: str, remetente: str, corpo_preview: str,
                                msg_id: str = "") -> str:
@@ -1246,300 +1296,287 @@ def classificar_email_pipeline(assunto: str, remetente: str, corpo_preview: str,
     Ordem de decisão (mais barata → mais cara):
       1. Cache local   — grátis, instantâneo
       2. Heurística    — grátis, 0 tokens
-      3. Gemini        — só se houver budget disponível
+      3. IA            — só se houver budget disponível
 
-    Retorna: "vaga" | "certificado" | "alerta_acesso" | "agendamento" |
+    Retorna: "vaga" | "certificado" | "alerta" | "agendamento" |
              "financeiro" | "servico" | "outro"
     """
-    chave = _cache_key("classif", msg_id) if msg_id else ""
+    cached = _cache_get("classif", msg_id, str)
+    if cached:
+        Log.info(f"  💾 Cache hit (classif): {cached}")
+        return cached
 
-    # 1. Cache
-    if chave and chave in _GEMINI_CACHE:
-        resultado = _GEMINI_CACHE[chave]
-        Log.info(f"  💾 Cache hit (classif): {resultado}")
-        return resultado
-
-    # 2. Heurística — detecta fonte conhecida de vagas
-    fonte = _detectar_fonte(remetente)
-    if fonte != "outro":
-        if chave:
-            _GEMINI_CACHE[chave] = "vaga"
-            _salvar_cache(_GEMINI_CACHE)
+    # Fonte conhecida de vagas (Indeed, Catho...) → sempre vaga
+    if _detectar_fonte(remetente) != "outro":
+        _cache_set("classif", msg_id, "vaga")
         return "vaga"
 
     txt = (assunto + " " + corpo_preview[:400]).lower()
 
-    for p in PALAVRAS_NAO_VAGA:
-        if p in txt:
-            # Ainda pode ser agendamento ou financeiro — heurística rápida
-            if any(w in txt for w in ["agendamento","confirmado","reserva","horário","consulta"]):
-                return "agendamento"
-            if any(w in txt for w in ["fatura","boleto","cobrança","pagamento","nota fiscal","pix"]):
-                return "financeiro"
-            return "servico"
+    # Palavras de exclusão têm prioridade (cursos, newsletters, promoções...)
+    if any(p in txt for p in PALAVRAS_NAO_VAGA):
+        if any(w in txt for w in _PALAVRAS_AGENDAMENTO):
+            return "agendamento"
+        if any(w in txt for w in _PALAVRAS_FINANCEIRO):
+            return "financeiro"
+        return "servico"
 
-    for p in PALAVRAS_VAGA:
-        if p in txt:
-            if chave:
-                _GEMINI_CACHE[chave] = "vaga"
-                _salvar_cache(_GEMINI_CACHE)
-            return "vaga"
+    if any(p in txt for p in PALAVRAS_VAGA):
+        _cache_set("classif", msg_id, "vaga")
+        return "vaga"
 
-    # Agendamento heurístico
-    if any(w in txt for w in ["agendamento","confirmado","reserva","horário","consulta","appointment"]):
+    if any(w in txt for w in _PALAVRAS_AGENDAMENTO):
         return "agendamento"
-
-    # Financeiro heurístico
-    if any(w in txt for w in ["fatura","boleto","cobrança","pagamento","nota fiscal","pix","débito","crédito"]):
+    if any(w in txt for w in _PALAVRAS_FINANCEIRO):
         return "financeiro"
 
-    # 3. Gemini — só se tiver budget e gemini_service disponível
-    if _GEMINI_SERVICE_OK and _tem_budget("geral"):
-        try:
-            resultado = _gs_classificar(assunto, remetente, corpo_preview)
-            _consumir_budget("geral")
-            if chave:
-                _GEMINI_CACHE[chave] = resultado
-                _salvar_cache(_GEMINI_CACHE)
-            return resultado
-        except Exception as e:
-            Log.warn(f"  Gemini classif falhou, usando heurística: {e}")
+    if not _tem_budget("geral"):
+        return "outro"
 
+    if gateway_disponivel():
+        resultado = _gs_classificar(assunto, remetente, corpo_preview)
+        status = _status_ia()
+        if status != "falha":
+            if status == "ok":   # a heurística do gemini_service não chama a IA
+                _consumir_budget("geral")
+            _cache_set("classif", msg_id, resultado)
+            return resultado
+
+    # IA indisponível/falhou: o e-mail pode ser uma vaga — fica pendente
+    # (até MAX_TENTATIVAS_IA vezes; depois segue como "outro")
+    if _pode_retentar("classif", msg_id):
+        _PENDENTES_IA.add(msg_id)
+        return "indeterminado"
     return "outro"
 
 
+def _vaga_heuristica(assunto: str, remetente: str, corpo: str,
+                     ancoras: list[dict] | None) -> dict:
+    """Vaga 'mínima' montada sem IA — usada quando o budget do dia acabou."""
+    return {
+        "cargo":              assunto,
+        "empresa":            None,
+        "local":              None,
+        "modelo_trabalho":    "Não informado",
+        "salario":            None,
+        "requisitos":         [],
+        "tecnologias":        _extrair_tecnologias(corpo),
+        "score_match":        0,
+        "link_candidatura":   _extrair_link_candidatura(corpo, remetente, ancoras),
+        "tipo_email":         "nova_vaga",
+        "status_candidatura": "nova",
+    }
+
+
 def extrair_vagas_pipeline(assunto: str, remetente: str, corpo: str,
-                           msg_id: str = "", ancoras: list[dict] | None = None) -> list[dict]:
+                           msg_id: str = "", ancoras: list[dict] | None = None) -> list[dict] | None:
     """
     Etapa 2: extrai N vagas de um e-mail.
 
     Ordem de decisão:
       1. Cache local   — reutiliza resultado anterior
-      2. Gemini        — só se houver budget de vagas
-      3. Fallback      — heurística simples, retorna 1 item sem score
+      2. IA            — só se houver budget de vagas
+      3. Heurística    — budget esgotado: 1 item sem score
 
-    [FIX] `ancoras` (texto do link + href real, extraído do HTML original)
-    é repassado ao Gemini via `links_html` para que ele associe cada vaga
-    ao link correto, em vez de "chutar" uma URL a partir do texto puro
-    (que nunca contém o href para Catho/InfoJobs, e gerava links
-    quebrados quando "adivinhados" para Indeed/Jobbol).
+    `ancoras` (texto do link + href real, extraído do HTML original) é
+    repassado à IA via `links_html` para que ela associe cada vaga ao link
+    correto, em vez de "chutar" uma URL a partir do texto puro.
 
     Cada item da lista tem: cargo, empresa, local, modelo_trabalho,
     salario, link_candidatura, requisitos, tecnologias, score_match,
     tipo_email, status_candidatura
+
+    Retorna [] quando a IA respondeu que não há vaga, e None quando o
+    e-mail não pôde ser processado agora (IA fora do ar ou falhou).
     """
-    chave = _cache_key("vagas", msg_id) if msg_id else ""
+    cached = _cache_get("vagas", msg_id, list)
+    if cached is not None:
+        Log.info(f"  💾 Cache hit (vagas): {len(cached)} vaga(s)")
+        return cached
 
-    # 1. Cache
-    if chave and chave in _GEMINI_CACHE:
-        cached = _GEMINI_CACHE[chave]
-        if isinstance(cached, list):
-            Log.info(f"  💾 Cache hit (vagas): {len(cached)} vaga(s)")
-            return cached
+    if not _tem_budget("vagas"):
+        Log.warn(f"  ⚠ Budget IA/vagas esgotado ({_GEMINI_BUDGET.get('vagas',0)}/{_BUDGET_LIMITE['vagas']}) — usando heurística")
+        return [_vaga_heuristica(assunto, remetente, corpo, ancoras)]
 
-    # 2. Gemini com budget
-    if _tem_budget("vagas"):
-        if _GEMINI_SERVICE_OK:
-            try:
-                resultado = _gs_extrair_vagas(assunto, remetente, corpo, links_html=ancoras)
-                _consumir_budget("vagas")
-                if chave and resultado:
-                    _GEMINI_CACHE[chave] = resultado
-                    _salvar_cache(_GEMINI_CACHE)
-                return resultado
-            except Exception as e:
-                Log.warn(f"  Gemini vagas falhou, tentando fallback: {e}")
-
-        # Fallback interno (sem gemini_service)
-        try:
-            dados = analisar_vaga_gemini_fallback(corpo or assunto)
+    if gateway_disponivel():
+        resultado = _gs_extrair_vagas(assunto, remetente, corpo, links_html=ancoras)
+        if _status_ia() == "ok":
             _consumir_budget("vagas")
-            if not dados:
-                return []
-            resultado = [{
-                "cargo":              dados.get("cargo")         or assunto,
-                "empresa":            dados.get("nome_empresa")  or "Não identificada",
-                "local":              dados.get("local"),
-                "modelo_trabalho":    dados.get("modelo_trabalho", "Não informado"),
-                "salario":            None,
-                "requisitos":         dados.get("requisitos_obrigatorios", []),
-                "tecnologias":        dados.get("tecnologias", []),
-                "score_match":        int(dados.get("score_match") or 0),
-                "link_candidatura":   _extrair_link_candidatura(corpo, remetente, ancoras),
-                "tipo_email":         "nova_vaga",
-                "status_candidatura": "nova",
-            }]
-            if chave:
-                _GEMINI_CACHE[chave] = resultado
-                _salvar_cache(_GEMINI_CACHE)
+            # Inclusive [] — senão um aviso sem vaga real ("sua candidatura
+            # foi visualizada") voltaria para a IA a cada execução.
+            _cache_set("vagas", msg_id, resultado, permitir_vazio=True)
             return resultado
-        except Exception as e:
-            Log.warn(f"  Fallback Gemini vagas falhou: {e}")
 
-    else:
-        # Budget esgotado — heurística local pura (0 tokens)
-        Log.warn(f"  ⚠ Budget Gemini/vagas esgotado ({_GEMINI_BUDGET.get('vagas',0)}/{_BUDGET_LIMITE['vagas']}) — usando heurística")
-        techs = _extrair_tecnologias(corpo)
-        link  = _extrair_link_candidatura(corpo, remetente, ancoras)
-        return [{
-            "cargo":              assunto,
-            "empresa":            "Não identificada (sem Gemini)",
-            "local":              None,
-            "modelo_trabalho":    "Não informado",
-            "salario":            None,
-            "requisitos":         [],
-            "tecnologias":        techs,
-            "score_match":        0,
-            "link_candidatura":   link,
-            "tipo_email":         "nova_vaga",
-            "status_candidatura": "nova",
-        }]
-
-    return []
+    # Sem IA agora: o e-mail fica sem label e é reprocessado depois (sem gastar budget)
+    if _pode_retentar("vagas", msg_id):
+        Log.warn("  ⚠ IA indisponível/falhou — e-mail fica para a próxima execução")
+        return None
+    Log.warn(f"  ⚠ IA falhou {MAX_TENTATIVAS_IA}x neste e-mail — usando heurística")
+    return [_vaga_heuristica(assunto, remetente, corpo, ancoras)]
 
 
 def analisar_acesso_pipeline(remetente: str, assunto: str, corpo: str,
                              msg_id: str = "") -> dict:
     """Valida OTP / alertas de login. Usa cache + budget."""
-    chave = _cache_key("alerta", msg_id) if msg_id else ""
-
-    # Cache
-    if chave and chave in _GEMINI_CACHE:
-        cached = _GEMINI_CACHE[chave]
-        if isinstance(cached, dict):
-            Log.info(f"  💾 Cache hit (alerta)")
-            return cached
+    cached = _cache_get("alerta", msg_id, dict)
+    if cached is not None:
+        Log.info("  💾 Cache hit (alerta)")
+        return cached
 
     if not _tem_budget("alertas"):
-        Log.warn(f"  ⚠ Budget Gemini/alertas esgotado — alerta ignorado")
+        Log.warn("  ⚠ Budget IA/alertas esgotado — alerta ignorado")
+        return {}
+    if not gateway_disponivel():
         return {}
 
-    if _GEMINI_SERVICE_OK:
-        try:
-            resultado = _gs_analisar_acesso(remetente, assunto, corpo)
-            _consumir_budget("alertas")
-            if chave and resultado:
-                _GEMINI_CACHE[chave] = resultado
-                _salvar_cache(_GEMINI_CACHE)
-            return resultado
-        except Exception as e:
-            Log.warn(f"  Gemini acesso falhou: {e}")
-
-    try:
-        resultado = analisar_acesso_gemini(remetente, assunto, corpo)
+    resultado = _gs_analisar_acesso(remetente, assunto, corpo)
+    if _status_ia() == "ok":
         _consumir_budget("alertas")
-        if chave and resultado:
-            _GEMINI_CACHE[chave] = resultado
-            _salvar_cache(_GEMINI_CACHE)
-        return resultado
-    except Exception as e:
-        Log.warn(f"  Gemini acesso fallback falhou: {e}")
-        return {}
+        _cache_set("alerta", msg_id, resultado)
+    return resultado
 
 
 def classificar_geral_pipeline(remetente: str, assunto: str, corpo: str,
-                               msg_id: str = "") -> dict:
-    """Extrai info de agendamentos e financeiros. Usa cache + budget geral."""
-    chave = _cache_key("geral", msg_id) if msg_id else ""
-
-    if chave and chave in _GEMINI_CACHE:
-        cached = _GEMINI_CACHE[chave]
-        if isinstance(cached, dict):
-            return cached
+                               msg_id: str = "") -> dict | None:
+    """
+    Extrai info de agendamentos, vencimentos etc. Usa cache + budget geral.
+    Retorna {} quando o budget acabou (segue só com a heurística) e None
+    quando a IA está indisponível/falhou (vale tentar de novo depois).
+    """
+    cached = _cache_get("geral", msg_id, dict)
+    if cached is not None:
+        return cached
 
     if not _tem_budget("geral"):
         return {}
+    if not gateway_disponivel():
+        return None
 
-    if _GEMINI_SERVICE_OK:
-        try:
-            resultado = _gs_classificar_geral(remetente, assunto, corpo)
-            _consumir_budget("geral")
-            if chave and resultado:
-                _GEMINI_CACHE[chave] = resultado
-                _salvar_cache(_GEMINI_CACHE)
-            return resultado
-        except Exception as e:
-            Log.warn(f"  Gemini geral falhou: {e}")
-    return {}
-
-
-# ── Funções de fallback (mantidas para compatibilidade) ──────────────────────
-
-def analisar_vaga_gemini_fallback(texto: str) -> dict:
-    prompt = f"""
-Você é um assistente de RH especializado em tecnologia.
-Analise o texto abaixo e responda APENAS em JSON estrito (sem crases):
-{{
-  "eh_vaga_real": true/false,
-  "motivo_classificacao": "vaga de emprego | curso | newsletter | bootcamp | outro",
-  "cargo": "string ou null",
-  "nome_empresa": "string ou null",
-  "local": "string ou null",
-  "modelo_trabalho": "Remoto | Híbrido | Presencial | Não informado",
-  "requisitos_obrigatorios": ["lista"],
-  "requisitos_desejaveis": ["lista"],
-  "tecnologias": ["lista"],
-  "vaga_python_dados": true/false,
-  "score_match": <0-100>
-}}
-Texto:
-{texto[:3000]}
-{INSTRUCAO_JSON_PURO}
-"""
-    try:
-        raw = _gerar_gemini(prompt)
-        return _parse_gemini_json(raw)
-    except Exception as e:
-        Log.warn(f"  Gemini fallback falhou: {e}")
-        return {}
-
-
-def analisar_acesso_gemini(remetente: str, assunto: str, corpo: str) -> dict:
-    prompt = f"""
-Você é um assistente de segurança digital.
-Analise o e-mail e responda APENAS em JSON estrito (sem crases):
-{{
-  "eh_email_de_acesso": true/false,
-  "plataforma": "nome da empresa",
-  "tipo_solicitacao": "otp | recuperacao_senha | alerta_novo_login | irrelevante",
-  "codigo_ou_link": "código ou URL ou null",
-  "justificativa_curta": "1 frase"
-}}
-Remetente: {remetente}
-Assunto: {assunto}
-Corpo: {corpo[:800]}
-{INSTRUCAO_JSON_PURO}
-"""
-    try:
-        raw = _gerar_gemini(prompt)
-        return _parse_gemini_json(raw)
-    except Exception as e:
-        Log.warn(f"  Gemini acesso falhou: {e}")
-        return {}
+    resultado = _gs_classificar_geral(remetente, assunto, corpo)
+    if _status_ia() != "ok":
+        # Falha pontual → tenta de novo depois; falha repetida → segue só com a heurística
+        return None if _pode_retentar("geral", msg_id) else {}
+    _consumir_budget("geral")
+    _cache_set("geral", msg_id, resultado)
+    return resultado
 
 
 # ===========================================================================
 # 7. MÓDULO DE VAGAS
 # ===========================================================================
 
-def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: bool):
+def notificar_vaga(vaga: dict) -> bool:
+    """Push no Telegram para vagas de alta prioridade (no-op se não configurado)."""
+    if not telegram_configurado():
+        return False
+    linhas = [
+        f"🔥 <b>{escapar_html(vaga['cargo'])}</b> — {vaga.get('score_gemini', 0)}%",
+        escapar_html(f"{vaga['empresa']} · {vaga.get('modelo_trabalho') or 'Não informado'}"
+                     + (f" · {vaga['local']}" if vaga.get("local") else "")),
+    ]
+    if vaga.get("link_candidatura"):
+        linhas.append(f'<a href="{escapar_html(vaga["link_candidatura"])}">Ver vaga</a>')
+    return enviar_telegram("\n".join(linhas))
+
+
+def preparar_rascunho_candidatura(service, vaga: dict, texto_email: str) -> str | None:
+    """
+    Gera a carta (IA) e cria o rascunho no Gmail para uma vaga de score alto.
+    Uma vez por vaga (marcado no cache) e dentro do budget diário "cartas".
+    Retorna o id do rascunho ou None.
+    """
+    uid = _vaga_uid(vaga.get("email_id"), vaga.get("cargo"), vaga.get("empresa"))
+    if _cache_get("rascunho", uid, str):
+        return None
+    if not _tem_budget("cartas") or not gateway_disponivel():
+        return None
+    perfil = candidatura.carregar_perfil()
+    if not perfil:
+        Log.warn(f"  Perfil não encontrado em {candidatura.PERFIL_PATH} — rascunho não gerado")
+        return None
+
+    carta = _gs_gerar_carta(vaga, perfil)
+    if _status_ia() == "ok":
+        _consumir_budget("cartas")
+    if not carta:
+        return None
+
+    msg = candidatura.montar_mensagem(
+        vaga, carta,
+        destinatario=candidatura.extrair_email_recrutador(texto_email),
+        curriculo_pdf=candidatura.CURRICULO_PDF or None,
+    )
+    try:
+        rascunho_id = candidatura.criar_rascunho(service, msg)
+    except HttpError as e:
+        Log.warn(f"  Falha ao criar rascunho de candidatura: {e}")
+        return None
+    _cache_set("rascunho", uid, rascunho_id or "ok")
+    return rascunho_id
+
+
+def _uma_vez_chave(acao: str, chave: str, executar) -> None:
+    """
+    Executa um efeito colateral (push, tarefa, evento...) no máximo uma vez
+    por chave — marcado no cache — e sem deixar uma exceção interromper o
+    resto do processamento do e-mail (que ainda precisa receber a label).
+    """
+    if _cache_get(acao, chave, str):
+        return
+    try:
+        if executar():
+            _cache_set(acao, chave, "ok")
+    except Exception as e:
+        Log.warn(f"  {acao} falhou ({chave}): {e}")
+
+
+def _uma_vez(acao: str, vaga: dict, executar) -> None:
+    """_uma_vez_chave() para efeitos de uma vaga específica."""
+    _uma_vez_chave(acao, _vaga_uid(vaga.get("email_id"), vaga.get("cargo"), vaga.get("empresa")), executar)
+
+
+def acoes_vaga_prioritaria(service, tasks_service, vaga: dict, texto_recrutador: str) -> None:
+    """Telegram + Google Tasks (score ≥ SCORE_NOTIFICAR_VAGA) e rascunho de candidatura."""
+    if vaga.get("tipo_email") != "nova_vaga":
+        return
+    if int(vaga.get("score_gemini") or 0) >= SCORE_NOTIFICAR_VAGA:
+        if telegram_configurado():
+            _uma_vez("notif", vaga, lambda: notificar_vaga(vaga))
+        if tasks_service:
+            def _tarefa():
+                if criar_tarefa_vaga(tasks_service, vaga):
+                    Log.ok("      ✅ Follow-up criado no Google Tasks")
+                    return True
+            _uma_vez("tarefa", vaga, _tarefa)
+    if candidatura.deve_gerar_rascunho(vaga):
+        # preparar_rascunho_candidatura já marca "rascunho" no cache; aqui só isola exceções
+        try:
+            if preparar_rascunho_candidatura(service, vaga, texto_recrutador):
+                Log.ok("      ✉️  Rascunho de candidatura criado no Gmail")
+        except Exception as e:
+            Log.warn(f"  rascunho falhou para '{vaga.get('cargo')}': {e}")
+
+
+def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: bool,
+                tasks_service=None):
     Log.section("Módulo 1 — Extração de Vagas")
 
+    # Pula e-mails que qualquer módulo já etiquetou — antes, todo e-mail da
+    # janela era relido (e salvo de novo no Supabase) a cada execução.
+    query = f"{query} {_QUERY_JA_PROCESSADO}"
     try:
-        listagem = service.users().messages().list(
-            userId="me", maxResults=50, q=query
-        ).execute()
-        msgs = listagem.get("messages", [])
+        msgs = _listar_mensagens(service, query, LIMITE_EMAILS)
     except HttpError as e:
         Log.error(f"Erro ao listar e-mails de vagas: {e}")
         return
 
-    Log.info(f"E-mails encontrados com a query '{query}': {len(msgs)}")
+    Log.info(f"E-mails novos na janela: {len(msgs)}")
 
     total_emails  = 0
     total_vagas   = 0
     total_salvas  = 0
     total_outros  = 0
+    total_atualizadas = 0
 
     for msg in msgs:
         try:
@@ -1575,20 +1612,29 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
         Log.info(f"  Extraindo vagas de: {assunto[:60]}")
         vagas_extraidas = extrair_vagas_pipeline(assunto, remetente, corpo, msg["id"], ancoras=ancoras)
 
+        if vagas_extraidas is None:
+            continue   # IA indisponível — sem label, tenta de novo na próxima execução
         if not vagas_extraidas:
-            Log.warn(f"  Nenhuma vaga extraída de: {assunto[:50]}")
+            # A IA leu e não há vaga real: marca como processado para não gastar IA de novo
+            Log.info(f"  Nenhuma vaga real em: {assunto[:50]}")
+            _aplicar_label(service, msg["id"], labels.get("vagas_pai"))
+            total_emails += 1
             continue
 
         Log.info(f"  {len(vagas_extraidas)} vaga(s) encontrada(s) neste e-mail")
 
         score_max = 0
         ancoras_usadas: set = set()
+        techs_corpo = _extrair_tecnologias(corpo)
         for vaga_raw in vagas_extraidas:
-            # Enriquece com tecnologias detectadas heuristicamente
-            techs_h  = _extrair_tecnologias(corpo)
             techs_g  = [t.lower() for t in vaga_raw.get("tecnologias", [])
                         if isinstance(t, str)]
-            techs    = list(dict.fromkeys(techs_h + techs_g))
+            # Tecnologias achadas no corpo inteiro só valem para e-mails de
+            # 1 vaga — num digest elas misturariam as stacks de todas as vagas.
+            if len(vagas_extraidas) == 1:
+                techs = list(dict.fromkeys(techs_corpo + techs_g))
+            else:
+                techs = techs_g or techs_corpo
             score    = vaga_raw.get("score_match", 0) or 0
             score_max = max(score_max, score)
 
@@ -1613,17 +1659,24 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
                 "local":             vaga_raw.get("local"),
                 "modelo_trabalho":   vaga_raw.get("modelo_trabalho", "Não informado"),
                 "salario":           vaga_raw.get("salario"),
-                "requisitos":        json.dumps(vaga_raw.get("requisitos", []),
-                                               ensure_ascii=False),
-                "tecnologias":       json.dumps(techs, ensure_ascii=False),
+                "requisitos":        vaga_raw.get("requisitos", []),
+                "tecnologias":       techs,
                 "score_gemini":      score,
                 "tipo_email":        vaga_raw.get("tipo_email",         "nova_vaga"),
                 "status_candidatura":vaga_raw.get("status_candidatura", "nova"),
                 "link_candidatura":  link,
                 "descricao":         corpo[:400] if corpo else "",
                 "data_email":        data,
-                "status":            "nova",
+                "status":            _status_do_email(vaga_raw.get("tipo_email"),
+                                                      vaga_raw.get("status_candidatura")),
             }
+
+            # E-mail de acompanhamento de uma candidatura já conhecida →
+            # atualiza a vaga existente em vez de criar uma duplicada.
+            if (vaga["tipo_email"] != "nova_vaga" and not dry_run
+                    and atualizar_status_vaga(sb, vaga, vaga["status"])):
+                total_atualizadas += 1
+                continue
 
             salvo = salvar_vaga(sb, vaga, dry_run)
             if salvo:
@@ -1634,6 +1687,12 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
             tipo = vaga_raw.get("tipo_email", "nova_vaga")
             lk   = f" → {link[:50]}" if link else ""
             Log.ok(f"    {flag} [{tipo}] {vaga['cargo']} @ {vaga['empresa']} — score {score}%{lk}")
+
+            if not dry_run:
+                # Num digest o e-mail do recrutador não é confiável por vaga
+                mailtos = " ".join(re.findall(r'mailto:([^"?\s>]+)', html_bruto or ""))
+                texto_recrutador = f"{corpo} {mailtos}" if len(vagas_extraidas) == 1 else ""
+                acoes_vaga_prioritaria(service, tasks_service, vaga, texto_recrutador)
 
             time.sleep(0.5)  # throttle entre vagas do mesmo e-mail
 
@@ -1649,7 +1708,8 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
 
     Log.section(
         f"Vagas: {total_emails} e-mails | {total_vagas} vagas | "
-        f"{total_salvas} salvas | {total_outros} outros módulos"
+        f"{total_salvas} salvas | {total_atualizadas} status atualizados | "
+        f"{total_outros} outros módulos"
     )
 
 
@@ -1792,8 +1852,7 @@ def rodar_certificados(service, drive_service, labels: dict, sb: Client | None,
     Log.info(f"Query: '{query}'")
 
     try:
-        res = service.users().messages().list(userId="me", q=query, maxResults=20).execute()
-        msgs = res.get("messages", [])
+        msgs = _listar_mensagens(service, query, LIMITE_EMAILS)
     except HttpError as e:
         Log.error(f"Erro ao listar e-mails de certificados: {e}")
         return
@@ -1813,16 +1872,17 @@ def rodar_certificados(service, drive_service, labels: dict, sb: Client | None,
         assunto  = _header(headers, "Subject", "Sem Assunto")
         Log.info(f"  Processando: {assunto[:60]}")
 
-        partes            = detalhe["payload"].get("parts", [])
+        # [FIX] Percorre partes aninhadas: a maioria dos e-mails com anexo é
+        # multipart/mixed → multipart/alternative → text/html, e antes só o
+        # 1º nível era lido (o HTML e o PDF ficavam invisíveis).
+        partes            = list(_iterar_partes(detalhe["payload"]))
         sucesso           = False
         drive_url         = None
         caminho_resultado = ""
         plataforma_cert   = "desconhecido"   # será sobrescrito na extração
 
-        # --- Parte A: anexos diretos ---
-        for parte in partes:
-            if not parte.get("filename"):
-                continue
+        # --- Parte A: anexos diretos (PDF primeiro; logos inline ignoradas) ---
+        for parte in _anexos_certificado(partes):
             dados_b64 = parte["body"].get("data", "")
             if not dados_b64 and parte["body"].get("attachmentId"):
                 try:
@@ -1857,10 +1917,7 @@ def rodar_certificados(service, drive_service, labels: dict, sb: Client | None,
 
         # --- Parte B: links de rastreamento / portais ---
         if not sucesso:
-            html_body = ""
-            for parte in partes:
-                if parte.get("mimeType") == "text/html":
-                    html_body = _decode_b64(parte["body"].get("data", ""))
+            _, html_body = _extrair_corpo_e_html(detalhe["payload"])
 
             links = _extrair_links_certificado(html_body)  # lista de dicts
             for item in links:
@@ -1965,8 +2022,7 @@ def rodar_alertas(service, labels: dict, sb: Client | None, query_dias: int, dry
     Log.info(f"Query: '{query}'")
 
     try:
-        res = service.users().messages().list(userId="me", q=query, maxResults=10).execute()
-        msgs = res.get("messages", [])
+        msgs = _listar_mensagens(service, f"{query} -label:{LABEL_TREE['alerta_pai']['nome']}", LIMITE_EMAILS)
     except HttpError as e:
         Log.error(f"Erro ao listar e-mails de acesso: {e}")
         return
@@ -2015,6 +2071,15 @@ def rodar_alertas(service, labels: dict, sb: Client | None, query_dias: int, dry
         _aplicar_label(service, msg["id"], labels.get("alerta_pai"), tipo_label)
         # ────────────────────────────────────────────────────────────────────
 
+        idade = _idade_minutos(detalhe)
+        if not dry_run and telegram_configurado() and idade is not None and idade <= OTP_MAX_IDADE_MIN:
+            linhas = [f"🔒 <b>{escapar_html(plataforma)}</b> — {escapar_html(tipo)}"]
+            if codigo:
+                linhas.append(f"<code>{escapar_html(codigo)}</code>")
+            linhas.append(f"<i>{escapar_html(assunto[:80])}</i>")
+            if enviar_telegram("\n".join(linhas)):
+                Log.ok("  📲 Enviado para o Telegram")
+
         alerta_record = {
             "email_id":         msg["id"],
             "plataforma":       plataforma,
@@ -2038,6 +2103,16 @@ def rodar_alertas(service, labels: dict, sb: Client | None, query_dias: int, dry
 # ===========================================================================
 
 # Palavras-chave para classificar e-mails gerais por categoria
+# Veículo usa regex com limite de palavra: "seguro auto" não pode casar com
+# "pagamento seguro automático", nem "licenciamento" com licença de software.
+_PADROES_VEICULO = re.compile(
+    r"\b(detran|ipva|crlv|renavam|dpvat|semparar|conectcar|veloe"
+    r"|licenciamento (?:anual|d[eo] ve[ií]culo|\d{4})"
+    r"|multa de tr[aâ]nsito|auto de infra[cç][aã]o|notifica[cç][aã]o de autua[cç][aã]o|infra[cç][aã]o de tr[aâ]nsito"
+    r"|carteira nacional de habilita[cç][aã]o|renova[cç][aã]o da cnh"
+    r"|seguro (?:auto|autom[oó]vel|d[eo] (?:carro|ve[ií]culo|moto))|vistoria veicular)\b"
+)
+
 _PADROES_GERAL = {
     "agendamento": [
         "agendamento", "agendado", "confirmado", "reserva", "confirma sua visita",
@@ -2071,73 +2146,93 @@ _PADROES_GERAL = {
 }
 
 # Subcategorias para financeiro (usadas no campo categoria do Supabase)
+_SUBCATEGORIA_VEICULO = {
+    "veiculo_ipva":          ["ipva"],
+    "veiculo_licenciamento": ["licenciamento", "crlv", "dpvat"],
+    "veiculo_multa":         ["multa", "multas", "infração", "infracao", "autuação", "autuacao"],
+    "veiculo_cnh":           ["cnh", "habilitação", "habilitacao"],
+    "veiculo_seguro":        ["seguro"],
+    "veiculo_pedagio":       ["semparar", "conectcar", "veloe", "pedágio", "pedagio"],
+}
+
 _SUBCATEGORIA_FINANCEIRO = {
-    "boleto_fatura": ["boleto", "fatura", "vence", "vencimento", "valor a pagar", "emitido por"],
+    "boleto_fatura": ["boleto", "fatura", "vence", "vencimento", "valor a pagar", "emitido por", "pagar até"],
     "pix":           ["pix", "transferência", "ted", "doc"],
     "recibo":        ["comprovante", "recibo", "nfe", "nota fiscal"],
     "assinatura":    ["assinatura", "renovação", "google play", "renovada"],
-    "cobranca":      ["cobrança", "debito", "crédito"],
+    "cobranca":      ["cobrança", "cobranca", "débito", "debito", "crédito", "pendente"],
 }
+
+def _contem_termo(texto: str, termos: list[str]) -> bool:
+    """Casa termos como palavra inteira — "doc" não pode casar com "documento", nem "ted" com "conectado"."""
+    return any(re.search(r"(?<!\w)" + re.escape(t) + r"(?!\w)", texto) for t in termos)
+
+
+def _detectar_subcategoria_veiculo(texto: str) -> str:
+    txt = texto.lower()
+    for sub, palavras in _SUBCATEGORIA_VEICULO.items():
+        if _contem_termo(txt, palavras):
+            return sub
+    return "veiculo_outros"
+
 
 def _detectar_subcategoria_financeiro(texto: str) -> str:
     txt = texto.lower()
     for sub, palavras in _SUBCATEGORIA_FINANCEIRO.items():
-        if any(p in txt for p in palavras):
+        if _contem_termo(txt, palavras):
             return sub
     return "boleto_fatura"
 
-# Prompt Gemini para classificar e-mail geral
-def _classificar_email_geral_gemini(remetente: str, assunto: str, corpo: str) -> dict:
-    return _parse_gemini_json(_gerar_gemini(f"""
-Você é um assistente pessoal que organiza e-mails.
-Analise o e-mail abaixo e responda APENAS em JSON estrito (sem crases):
-{{
-  "categoria": "agendamento | financeiro | servicos | outro",
-  "resumo": "1 frase resumindo o que o e-mail diz",
-  "remetente_nome": "nome amigável do remetente (ex: Barbearia Hermanos)",
-  "data_evento": "se for agendamento, data/hora do evento como string, ou null",
-  "valor": "se for financeiro, valor como string (ex: R$ 49,90), ou null",
-  "link_principal": "URL mais importante do e-mail, ou null",
-  "requer_acao": true/false
-}}
-Remetente: {remetente}
-Assunto: {assunto}
-Corpo: {corpo[:800]}
-{INSTRUCAO_JSON_PURO}
-"""))
+def _como_bool(valor) -> bool:
+    """A IA às vezes manda "false"/"sim" como texto — bool("false") seria True."""
+    if isinstance(valor, str):
+        return valor.strip().lower() in ("true", "sim", "yes", "1", "s")
+    return bool(valor)
+
+
+_CATEGORIAS_GERAIS = {"agendamento", "financeiro", "comunicado", "servicos", "veiculo"}
+
+
+def _normalizar_categoria_geral(categoria_ia: str | None, categoria_heuristica: str) -> str:
+    """
+    A IA às vezes responde no singular ("servico") ou com "outro". Antes a
+    resposta sobrescrevia a heurística sem validação — e como o prompt nem
+    tinha "comunicado", e-mails que a heurística marcava como comunicado
+    nunca recebiam a label Geral/Comunicado.
+    """
+    cat = (categoria_ia or "").strip().lower()
+    cat = {"servico": "servicos", "serviço": "servicos", "serviços": "servicos"}.get(cat, cat)
+    return cat if cat in _CATEGORIAS_GERAIS else categoria_heuristica
 
 
 def _categoria_heuristica(assunto: str, corpo: str) -> str:
     """Classificação rápida sem consumir token do Gemini."""
     txt = (assunto + " " + corpo[:300]).lower()
+    # Veículo antes de financeiro: um boleto de IPVA é "veículo"
+    if _PADROES_VEICULO.search(txt):
+        return "veiculo"
     for cat, padroes in _PADROES_GERAL.items():
         if any(p in txt for p in padroes):
             return cat
     return "servicos"   # fallback
 
 
-def salvar_email_geral(sb: Client | None, registro_raw: dict, dry_run: bool = False) -> bool:
-    if dry_run:
-        Log.info(f"  [DRY-RUN] {registro_raw.get('categoria')} — {registro_raw.get('assunto','')[:40]}")
-        return True
-    if not sb:
-        return False
-    # Financeiros → despesas_domesticas
-    if registro_raw.get("categoria") == "financeiro":
-        registro = {
-            "gmail_message_id": registro_raw.get("email_id"),
-            "estabelecimento":  registro_raw.get("remetente_nome"),
-            "categoria":        "servico",
-            "valor":            None,
-            "data_despesa":     None,
-            "origem_recurso":   "email",
-        }
-        return _sb_upsert_insert(sb, "despesas_domesticas", registro, "gmail_message_id")
-    # Demais categorias — label aplicada, sem tabela dedicada ainda
-    return True
+def agendar_no_calendario(calendar_service, msg_id: str, registro: dict) -> None:
+    """Vencimento/agendamento com data futura → evento no Google Calendar (uma vez por e-mail)."""
+    evento = calendario.evento_do_registro(registro)
+    if not evento:
+        return
+
+    def _criar():
+        if calendario.criar_evento(calendar_service, evento):
+            Log.ok(f"      🗓  Evento no Calendar: {evento['summary']}")
+            return True
+
+    _uma_vez_chave("evento", msg_id, _criar)
 
 
-def rodar_emails_gerais(service, labels: dict, sb: Client | None, query: str, dry_run: bool):
+def rodar_emails_gerais(service, labels: dict, sb: Client | None, query: str, dry_run: bool,
+                        calendar_service=None):
     """
     Processa e-mails que não são vagas, certificados ou alertas.
     Usa heurística rápida para economizar tokens; chama Gemini apenas para
@@ -2147,25 +2242,13 @@ def rodar_emails_gerais(service, labels: dict, sb: Client | None, query: str, dr
     Log.section("Módulo 4 — E-mails Gerais")
 
     # Exclui e-mails já processados pelos outros módulos
-    q_final = (
-        f"{query} "
-        f"-label:AutoApply/Vagas/Alta_Prioridade "
-        f"-label:AutoApply/Vagas/Baixa_Prioridade "
-        f"-label:AutoApply/Certificados/Extraido "
-        f"-label:AutoApply/Certificados/Pendente "
-        f"-label:AutoApply/Alertas/OTP "
-        f"-label:AutoApply/Alertas/Recuperacao "
-        f"-label:AutoApply/Geral/Agendamento "
-        f"-label:AutoApply/Geral/Financeiro "
-        f"-label:AutoApply/Geral/Servicos"
-    )
+    # [FIX] A lista antiga esquecia Geral/Comunicado — comunicados eram
+    # reclassificados (e gastavam budget de IA) em toda execução.
+    q_final = f"{query} {_QUERY_JA_PROCESSADO}"
     Log.info(f"Query: '{q_final[:90]}...'")
 
     try:
-        listagem = service.users().messages().list(
-            userId="me", maxResults=80, q=q_final
-        ).execute()
-        msgs = listagem.get("messages", [])
+        msgs = _listar_mensagens(service, q_final, LIMITE_EMAILS)
     except HttpError as e:
         Log.error(f"Erro ao listar e-mails gerais: {e}")
         return
@@ -2193,35 +2276,52 @@ def rodar_emails_gerais(service, labels: dict, sb: Client | None, query: str, dr
             Log.info(f"  ⏭ Ignorado (e-mail do próprio AutoApply AI): {assunto[:50]}")
             continue
 
+        # E-mail de vaga que o módulo de vagas não conseguiu extrair agora
+        # (IA fora do ar, budget...) fica sem label para ser tentado de novo
+        # — se este módulo o etiquetasse como Geral, a vaga se perderia.
+        if (_detectar_fonte(remetente) != "outro" or msg["id"] in _PENDENTES_IA
+                or _cache_get("classif", msg["id"], str) == "vaga"):
+            continue
+
         corpo     = extrair_corpo(detalhe["payload"])
 
         # 1. Classificação heurística (rápida, sem token)
         categoria = _categoria_heuristica(assunto, corpo)
 
-        # Detecta subcategoria para financeiro (ex: boleto_fatura, assinatura, pix)
-        subcategoria = (
-            _detectar_subcategoria_financeiro(assunto + " " + corpo[:200])
-            if categoria == "financeiro" else None
-        )
-
-        # 2. Para agendamentos/financeiros/comunicados vale gastar 1 token Gemini
+        # 2. Para agendamentos/financeiros/veículo/comunicados vale gastar 1 chamada de IA
         analise = {}
-        if _tem_budget("geral") and categoria in ("agendamento", "financeiro", "comunicado"):
+        if _tem_budget("geral") and categoria in ("agendamento", "financeiro", "veiculo", "comunicado"):
             try:
                 analise = classificar_geral_pipeline(remetente, assunto, corpo, msg["id"])
-                if analise.get("categoria"):
-                    categoria = analise["categoria"]
-                # Sobrescreve subcategoria se Gemini identificou melhor
-                if analise.get("subcategoria"):
-                    subcategoria = analise["subcategoria"]
+                if analise is None:
+                    # IA fora agora: sem label, para voltar com data/valor (e evento
+                    # no Calendar) quando o gateway responder
+                    Log.info(f"  ⏸ IA indisponível — fica para a próxima: {assunto[:50]}")
+                    continue
+                # A heurística de veículo é bem específica (Detran, IPVA...) e a
+                # IA tende a chamar isso só de "financeiro" — mantém veículo,
+                # exceto quando é um agendamento (vistoria, exame da CNH).
+                categoria_ia = _normalizar_categoria_geral(analise.get("categoria"), categoria)
+                if categoria != "veiculo" or categoria_ia == "agendamento":
+                    categoria = categoria_ia
             except Exception as e:
                 Log.warn(f"  Gemini geral falhou: {e}")
+
+        # Subcategoria (ex.: boleto_fatura, pix, veiculo_ipva) — depois da IA,
+        # que pode ter mudado a categoria
+        texto_sub = assunto + " " + corpo[:300]
+        subcategoria = (
+            _detectar_subcategoria_veiculo(texto_sub) if categoria == "veiculo"
+            else _detectar_subcategoria_financeiro(texto_sub) if categoria == "financeiro"
+            else None
+        )
 
         resumo = (
             analise.get("resumo")
             or assunto[:80]
         )
 
+        valor_num = _parsear_valor(analise.get("valor"))
         registro = {
             "email_id":       msg["id"],
             "assunto":        assunto,
@@ -2233,8 +2333,9 @@ def rodar_emails_gerais(service, labels: dict, sb: Client | None, query: str, dr
             "resumo":         resumo,
             "data_evento":    analise.get("data_evento"),
             "valor":          analise.get("valor"),
+            "valor_formatado": formatar_reais(valor_num) if valor_num is not None else None,
             "link_principal": analise.get("link_principal") or _extrair_link_candidatura(corpo),
-            "requer_acao":    bool(analise.get("requer_acao", False)),
+            "requer_acao":    _como_bool(analise.get("requer_acao")),
             "status":         "novo",
         }
 
@@ -2246,6 +2347,7 @@ def rodar_emails_gerais(service, labels: dict, sb: Client | None, query: str, dr
             "agendamento": "geral_agendamento",
             "financeiro":  "geral_financeiro",
             "comunicado":  "geral_comunicado",
+            "veiculo":     "geral_veiculo",
         }.get(categoria, "geral_servicos")
 
         _aplicar_label(
@@ -2256,8 +2358,12 @@ def rodar_emails_gerais(service, labels: dict, sb: Client | None, query: str, dr
         # ────────────────────────────────────────────────────────────────────
 
         total += 1
-        icone = {"agendamento": "📅", "financeiro": "💰", "servicos": "🔔"}.get(categoria, "📧")
+        icone = {"agendamento": "📅", "financeiro": "💰", "comunicado": "📢", "servicos": "🔔",
+                 "veiculo": "🚗"}.get(categoria, "📧")
         Log.ok(f"  {icone} [{categoria}] {remetente.split('<')[0].strip()[:30]} — {resumo[:50]}")
+
+        if calendar_service and not dry_run:
+            agendar_no_calendario(calendar_service, msg["id"], registro)
 
     Log.ok(f"E-mails gerais: {total} processados | {salvas} salvos no Supabase")
 
@@ -2306,13 +2412,20 @@ def main():
         "--dry-run", action="store_true",
         help="Executa sem gravar nada no Supabase/Drive (modo teste)",
     )
+    parser.add_argument(
+        "--intervalo", type=int, default=0, metavar="SEGUNDOS",
+        help=(
+            "Fica rodando em loop, repetindo os módulos a cada N segundos.\n"
+            "Ex.: --modulo alertas --intervalo 60  → OTPs no Telegram em ~1 min"
+        ),
+    )
     args = parser.parse_args()
 
     inicio = datetime.datetime.now()
     query  = f"newer_than:{args.dias}d"
 
     print(f"\n{'='*58}")
-    print(f"  AUTOAPPLY AI — Pipeline Principal  v2")
+    print(f"  AUTOAPPLY AI — Pipeline Principal  v3")
     print(f"  {datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')}  |  janela: {args.dias} dia(s)")
     if args.dry_run:
         print(f"  ⚠  MODO DRY-RUN — nenhum dado será gravado")
@@ -2320,33 +2433,50 @@ def main():
 
     try:
         service, drive_service = autenticar_google()
-    except FileNotFoundError as e:
+    except (FileNotFoundError, RuntimeError) as e:
         Log.error(str(e))
         sys.exit(1)
 
     labels = garantir_labels(service)
     sb = None if args.dry_run else criar_supabase()
+    tasks_service = google_auth.construir_servicos("tasks")[0] if google_auth.TASKS_ENABLED else None
+    calendar_service = google_auth.construir_servicos("calendar")[0] if google_auth.CALENDAR_ENABLED else None
 
-    modulos_rodados = []
     rodar_todos = args.modulo == "todos"
 
-    if rodar_todos or args.modulo == "vagas":
-        rodar_vagas(service, labels, sb, query, args.dry_run)
-        modulos_rodados.append("vagas")
+    def executar_ciclo() -> list:
+        modulos_rodados = []
+        if rodar_todos or args.modulo == "vagas":
+            rodar_vagas(service, labels, sb, query, args.dry_run, tasks_service)
+            modulos_rodados.append("vagas")
 
-    if rodar_todos or args.modulo == "certificados":
-        rodar_certificados(service, drive_service, labels, sb, args.dias, args.dry_run)
-        modulos_rodados.append("certificados")
+        if rodar_todos or args.modulo == "certificados":
+            rodar_certificados(service, drive_service, labels, sb, args.dias, args.dry_run)
+            modulos_rodados.append("certificados")
 
-    if rodar_todos or args.modulo == "alertas":
-        rodar_alertas(service, labels, sb, args.dias, args.dry_run)
-        modulos_rodados.append("alertas")
+        if rodar_todos or args.modulo == "alertas":
+            rodar_alertas(service, labels, sb, args.dias, args.dry_run)
+            modulos_rodados.append("alertas")
 
-    if rodar_todos or args.modulo == "geral":
-        rodar_emails_gerais(service, labels, sb, query, args.dry_run)
-        modulos_rodados.append("geral")
+        if rodar_todos or args.modulo == "geral":
+            rodar_emails_gerais(service, labels, sb, query, args.dry_run, calendar_service)
+            modulos_rodados.append("geral")
+        return modulos_rodados
 
-    imprimir_sumario(inicio, modulos_rodados)
+    if args.intervalo <= 0:
+        imprimir_sumario(inicio, executar_ciclo())
+        return
+
+    Log.info(f"Modo contínuo: repetindo a cada {args.intervalo}s (Ctrl+C para parar)")
+    try:
+        while True:
+            try:
+                executar_ciclo()
+            except Exception as e:   # uma falha de rede não deve matar o loop
+                Log.error(f"Ciclo falhou: {e}")
+            time.sleep(args.intervalo)
+    except KeyboardInterrupt:
+        imprimir_sumario(inicio, [args.modulo])
 
 
 if __name__ == "__main__":

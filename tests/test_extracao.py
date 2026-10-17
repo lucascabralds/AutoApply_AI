@@ -1,0 +1,159 @@
+import base64
+import json
+
+import main
+
+
+def _b64url(texto: str) -> str:
+    return base64.urlsafe_b64encode(texto.encode()).decode().rstrip("=")
+
+
+# ── Corpo do e-mail ──────────────────────────────────────────────────────────
+
+def test_extrai_corpo_e_html_de_multipart_aninhado():
+    payload = {
+        "mimeType": "multipart/mixed",
+        "parts": [
+            {
+                "mimeType": "multipart/alternative",
+                "parts": [
+                    {"mimeType": "text/plain", "body": {"data": _b64url("Olá Lucas")}},
+                    {"mimeType": "text/html", "body": {"data": _b64url('<a href="https://x.com/v">Ver vaga</a>')}},
+                ],
+            },
+            {"mimeType": "application/pdf", "filename": "cert.pdf", "body": {"attachmentId": "abc"}},
+        ],
+    }
+    corpo, html = main._extrair_corpo_e_html(payload)
+    assert corpo == "Olá Lucas"
+    assert "https://x.com/v" in html
+
+
+def test_limpar_html_separa_celulas_de_tabela():
+    texto = main._normalizar(main._limpar_html("<table><tr><td>Analista</td><td>HIRING</td></tr></table>"))
+    assert "Analista\n" in texto and "HIRING" in texto
+
+
+# ── Links ────────────────────────────────────────────────────────────────────
+
+def test_resolver_link_real_desembrulha_tracking_da_catho():
+    destino = "https://www.catho.com.br/vagas/dev-python/123"
+    payload = base64.urlsafe_b64encode(json.dumps({"r": destino}).encode()).decode().rstrip("=")
+    href = f"https://www.catho.com.br/channel-tracking/v1/clicked?i={payload}"
+    assert main._resolver_link_real(href) == destino
+
+
+def test_extrair_ancoras_ignora_descadastro_e_duplicados():
+    html = """
+      <a href="https://site.com/vaga/1">Desenvolvedor Python</a>
+      <a href="https://site.com/vaga/1">Desenvolvedor Python</a>
+      <a href="https://site.com/unsubscribe">Sair</a>
+      <a href="https://site.com/x">Cancelar inscrição</a>
+      <a href="mailto:a@b.com">mail</a>
+    """
+    ancoras = main._extrair_ancoras(html)
+    assert ancoras == [{"texto": "Desenvolvedor Python", "url": "https://site.com/vaga/1"}]
+
+
+def test_achar_ancora_por_cargo_nao_reutiliza_link():
+    ancoras = [
+        {"texto": "Analista de Dados Jr", "url": "https://a"},
+        {"texto": "Desenvolvedor Python Pleno", "url": "https://b"},
+    ]
+    usadas: set = set()
+    assert main._achar_ancora_por_cargo("Desenvolvedor Python", ancoras, usadas) == "https://b"
+    assert main._achar_ancora_por_cargo("Desenvolvedor Python", ancoras, usadas) is None
+    assert main._achar_ancora_por_cargo("Analista de Dados Jr", ancoras, usadas) == "https://a"
+
+
+def test_link_candidatura_prioriza_texto_de_acao():
+    ancoras = [
+        {"texto": "Logo", "url": "https://empresa.com"},
+        {"texto": "Candidatar-se agora", "url": "https://empresa.com/apply"},
+    ]
+    assert main._extrair_link_candidatura("", ancoras=ancoras) == "https://empresa.com/apply"
+
+
+def test_link_candidatura_sem_ancoras_descarta_tracking():
+    corpo = "Veja: https://click.mailchimp.com/track/1 e https://gupy.io/jobs/42"
+    assert main._extrair_link_candidatura(corpo) == "https://gupy.io/jobs/42"
+
+
+# ── Heurísticas ──────────────────────────────────────────────────────────────
+
+def test_email_proprio_e_ignorado():
+    assert main._eh_email_proprio("[AutoApply AI] Briefing Matinal — 01/01/2026")
+    assert not main._eh_email_proprio("Nova vaga: Dev Python")
+
+
+def test_tecnologias_respeitam_limite_de_palavra():
+    techs = main._extrair_tecnologias("Experiência com Python, SQL e Power BI; javascript desejável")
+    assert {"python", "sql", "power bi", "javascript"} <= set(techs)
+    assert "java" not in techs
+
+
+def test_parsear_data():
+    assert main._parsear_data("2026-06-29") == "2026-06-29"
+    assert main._parsear_data("vence em 29/06/2026") == "2026-06-29"
+    assert main._parsear_data("31/02/2026") is None
+    assert main._parsear_data(None) is None
+
+
+def test_subcategoria_financeiro():
+    assert main._detectar_subcategoria_financeiro("Seu boleto vence amanhã") == "boleto_fatura"
+    assert main._detectar_subcategoria_financeiro("Comprovante de Pix") == "pix"
+
+
+def test_normalizar_categoria_geral():
+    assert main._normalizar_categoria_geral("comunicado", "servicos") == "comunicado"
+    assert main._normalizar_categoria_geral("servico", "comunicado") == "servicos"
+    assert main._normalizar_categoria_geral("outro", "comunicado") == "comunicado"
+    assert main._normalizar_categoria_geral(None, "financeiro") == "financeiro"
+    assert main._normalizar_categoria_geral("inventada", "agendamento") == "agendamento"
+
+
+def test_heuristica_de_veiculo_nao_pega_falsos_positivos():
+    assert main._categoria_heuristica("IPVA 2027 disponível", "") == "veiculo"
+    assert main._categoria_heuristica("Licenciamento 2026 do seu carro", "") == "veiculo"
+    assert main._categoria_heuristica("Notificação de autuação", "") == "veiculo"
+    assert main._categoria_heuristica("Renovação do licenciamento de software Microsoft", "") != "veiculo"
+    assert main._categoria_heuristica("Pagamento seguro automático confirmado", "") != "veiculo"
+
+
+def test_anexo_com_content_id_mas_disposition_attachment_nao_e_inline():
+    pdf = {"filename": "c.pdf", "mimeType": "application/pdf",
+           "headers": [{"name": "Content-ID", "value": "<f_abc>"},
+                       {"name": "Content-Disposition", "value": "attachment; filename=c.pdf"}]}
+    logo = {"filename": "l.png", "mimeType": "image/png", "headers": [{"name": "Content-ID", "value": "<x>"}]}
+    assert not main._eh_inline(pdf)
+    assert main._eh_inline(logo)
+
+
+def test_subcategorias_casam_palavra_inteira():
+    assert main._detectar_subcategoria_financeiro("Cobrança pendente: segue o documento") == "cobranca"
+    assert main._detectar_subcategoria_financeiro("Você recebeu um Pix") == "pix"
+    assert main._detectar_subcategoria_financeiro("Seu TED foi concluído") == "pix"
+    assert main._detectar_subcategoria_veiculo("multas pendentes no detran") == "veiculo_multa"
+
+
+def test_veiculo_cobre_variacoes_comuns():
+    assert main._categoria_heuristica("Seu seguro automóvel vence em 10/11", "") == "veiculo"
+    assert main._categoria_heuristica("Licenciamento de veículo 2026", "") == "veiculo"
+
+
+def test_como_bool():
+    assert main._como_bool("false") is False and main._como_bool("Sim") is True
+    assert main._como_bool(True) is True and main._como_bool(None) is False
+
+
+def test_falha_de_ia_repetida_vira_heuristica_na_extracao(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "_GEMINI_CACHE", {})
+    monkeypatch.setattr(main, "_CACHE_PATH", str(tmp_path / "c.json"))
+    monkeypatch.setattr(main, "_BUDGET_PATH", str(tmp_path / "b.json"))
+    monkeypatch.setattr(main, "gateway_disponivel", lambda: True)
+    monkeypatch.setattr(main, "_status_ia", lambda: "falha")
+    monkeypatch.setattr(main, "_gs_extrair_vagas", lambda *a, **k: [])
+    resultados = [main.extrair_vagas_pipeline("Vaga Dev", "x@y.com", "python", "m9")
+                  for _ in range(main.MAX_TENTATIVAS_IA)]
+    assert resultados[:-1] == [None] * (main.MAX_TENTATIVAS_IA - 1)
+    assert resultados[-1][0]["cargo"] == "Vaga Dev" and resultados[-1][0]["score_match"] == 0

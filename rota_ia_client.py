@@ -19,6 +19,7 @@ Configuração (.env):
                       ou force um provedor específico com o id/name dele
 """
 
+import json
 import os
 import re
 import time
@@ -39,6 +40,109 @@ ROTA_IA_API_KEY = os.getenv("ROTA_IA_API_KEY")
 ROTA_IA_MODEL   = os.getenv("ROTA_IA_MODEL", "auto")
 
 CHAT_COMPLETIONS_ENDPOINT = f"{ROTA_IA_URL}/chat/completions"
+
+# ---------------------------------------------------------------------------
+# Circuit breaker: se o gateway não responde (Rota.IA desligado, porta
+# errada...), cada e-mail esperava todas as tentativas e ainda gastava o
+# budget diário. Quando uma chamada esgota as tentativas sem conseguir
+# CONECTAR, as próximas falham na hora durante ROTA_IA_PAUSA_SEG segundos —
+# e o pipeline usa a heurística local nesse intervalo. Timeout (provedor
+# lento, mas no ar) não pausa: um digest grande não pode calar os alertas.
+#
+# A pausa fica gravada em disco: o agendador abre um processo novo a cada
+# minuto, e uma pausa só em memória seria esquecida a cada execução.
+# ---------------------------------------------------------------------------
+PAUSA_SEG    = int(os.getenv("ROTA_IA_PAUSA_SEG", "300"))
+_DADOS_DIR   = os.getenv("AUTOAPPLY_DADOS_DIR") or os.path.dirname(os.path.abspath(__file__))
+_PAUSA_PATH  = os.path.join(_DADOS_DIR, "rota_ia_pausa.json")
+
+# Estado do breaker em disco: {"pausado_ate": epoch, "timeouts": n}
+_cache_estado: tuple[tuple, dict] = ((), {})   # (assinatura do arquivo, conteúdo)
+TIMEOUTS_PARA_PAUSAR = 2
+
+
+class GatewayIndisponivel(RuntimeError):
+    """O Rota.IA não respondeu nas últimas chamadas; nova tentativa só após a pausa."""
+
+
+def _assinatura() -> tuple:
+    """(caminho, mtime_ns, tamanho) — muda a cada escrita, inclusive no mesmo segundo."""
+    st = os.stat(_PAUSA_PATH)
+    return (_PAUSA_PATH, st.st_mtime_ns, st.st_size)
+
+
+def _ler_estado() -> dict:
+    """Lê o estado do disco só quando o arquivo muda (é consultado várias vezes por e-mail)."""
+    global _cache_estado
+    try:
+        assinatura = _assinatura()
+    except OSError:
+        return {}
+    if assinatura != _cache_estado[0]:
+        try:
+            with open(_PAUSA_PATH, encoding="utf-8") as f:
+                conteudo = json.load(f)
+            _cache_estado = (assinatura, conteudo if isinstance(conteudo, dict) else {})
+        except (OSError, ValueError):
+            _cache_estado = (assinatura, {})
+    return _cache_estado[1]
+
+
+def _gravar_estado(estado: dict) -> None:
+    global _cache_estado
+    try:
+        if any(estado.values()):
+            with open(_PAUSA_PATH, "w", encoding="utf-8") as f:
+                json.dump(estado, f)
+            _cache_estado = (_assinatura(), dict(estado))
+        elif os.path.exists(_PAUSA_PATH):
+            os.remove(_PAUSA_PATH)
+            _cache_estado = ((), {})
+    except OSError:
+        pass
+
+
+def _pausado_ate() -> float:
+    try:
+        return float(_ler_estado().get("pausado_ate", 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _gravar_pausa(ate: float) -> None:
+    _gravar_estado({"pausado_ate": ate, "timeouts": 0})
+
+
+def gateway_disponivel() -> bool:
+    """False enquanto o circuit breaker estiver aberto (gateway fora do ar)."""
+    return time.time() >= _pausado_ate()
+
+
+def _registrar_falha_de_conexao() -> None:
+    _gravar_pausa(time.time() + PAUSA_SEG)
+    logger.warning(
+        f"Rota.IA não responde em {ROTA_IA_URL} — pausando chamadas de IA por "
+        f"{PAUSA_SEG}s (o pipeline segue com heurísticas locais)."
+    )
+
+
+def _registrar_timeout() -> None:
+    """
+    Um timeout isolado é provedor lento; TIMEOUTS_PARA_PAUSAR chamadas
+    seguidas estourando o tempo é gateway travado (porta aberta, sem
+    resposta) — aí pausa como se estivesse fora do ar.
+    """
+    estado = _ler_estado()
+    timeouts = int(estado.get("timeouts", 0)) + 1
+    if timeouts >= TIMEOUTS_PARA_PAUSAR:
+        _registrar_falha_de_conexao()
+    else:
+        _gravar_estado({"pausado_ate": estado.get("pausado_ate", 0), "timeouts": timeouts})
+
+
+def _registrar_sucesso() -> None:
+    if _ler_estado():
+        _gravar_estado({})
 
 
 def _extrair_retry_delay(texto: str) -> float:
@@ -62,6 +166,9 @@ def chamar_ia(prompt: str, max_tentativas: int = 3, temperature: float = 0.1,
     Faz retry automático em 429 (rate limit) e 503 (provedor indisponível).
     Levanta a última exceção se todas as tentativas falharem.
     """
+    if not gateway_disponivel():
+        raise GatewayIndisponivel(f"Rota.IA indisponível em {ROTA_IA_URL} (pausa ativa)")
+
     if not ROTA_IA_API_KEY:
         raise ValueError(
             "ROTA_IA_API_KEY não encontrada no .env — inicie o gateway Rota.IA "
@@ -101,8 +208,26 @@ def chamar_ia(prompt: str, max_tentativas: int = 3, temperature: float = 0.1,
                 continue
 
             resp.raise_for_status()
-            data = resp.json()
-            return data["choices"][0]["message"]["content"]
+            # Lê o conteúdo ANTES de registrar sucesso: um 200 com {"error": ...}
+            # (sem "choices") é falha, não resposta da IA.
+            conteudo = resp.json()["choices"][0]["message"]["content"]
+            _registrar_sucesso()
+            return conteudo
+
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            ultima_exc = exc
+            if tentativa == max_tentativas:
+                # ReadTimeout = conectou mas não respondeu a tempo (conta, e pausa
+                # se repetir); ConnectTimeout/ConnectionError = inalcançável → pausa
+                if isinstance(exc, requests.ReadTimeout):
+                    _registrar_timeout()
+                else:
+                    _registrar_falha_de_conexao()
+                break
+            logger.warning(
+                f"Rota.IA — sem conexão (tentativa {tentativa}/{max_tentativas}): {exc}"
+            )
+            time.sleep(2)
 
         except requests.RequestException as exc:
             ultima_exc = exc

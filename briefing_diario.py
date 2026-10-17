@@ -23,8 +23,7 @@ import sys
 import json
 import argparse
 import datetime
-import smtplib
-import textwrap
+from html import escape
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -34,12 +33,12 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Google / Gmail (para envio via API, sem SMTP)
 # ---------------------------------------------------------------------------
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import base64
+
+import google_auth
+from formatacao import empresa_conhecida, formatar_reais
+from seguranca import redigir_segredo
 
 # ---------------------------------------------------------------------------
 # Supabase
@@ -51,17 +50,6 @@ from supabase import create_client, Client
 # ---------------------------------------------------------------------------
 SUPABASE_URL   = (os.getenv("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_KEY   = os.getenv("SUPABASE_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-_BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
-TOKEN_PATH       = os.getenv("GMAIL_TOKEN_PATH",       os.path.join(_BASE_DIR, "token.json"))
-CREDENTIALS_PATH = os.getenv("GMAIL_CREDENTIALS_PATH", os.path.join(_BASE_DIR, "credentials.json"))
-
-SCOPES_SEND = [
-    "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.modify",
-]
 
 # Destinatário do briefing — padrão: próprio Gmail
 DESTINATARIO = os.getenv("BRIEFING_DESTINATARIO", "me")
@@ -82,30 +70,9 @@ ICONES = {
 # ===========================================================================
 
 def _autenticar_gmail():
-    if not os.path.exists(CREDENTIALS_PATH):
-        raise FileNotFoundError(
-            f"credentials.json não encontrado em: {CREDENTIALS_PATH}"
-        )
-    creds = None
-    if os.path.exists(TOKEN_PATH):
-        try:
-            creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES_SEND)
-        except Exception:
-            creds = None
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except Exception:
-                creds = None
-        if not creds:
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES_SEND)
-            creds = flow.run_local_server(port=0)
-        with open(TOKEN_PATH, "w") as f:
-            f.write(creds.to_json())
-
-    return build("gmail", "v1", credentials=creds)
+    """Usa o mesmo token/escopos do main.py (ver google_auth.py)."""
+    (service,) = google_auth.construir_servicos("gmail")
+    return service
 
 
 # ===========================================================================
@@ -125,27 +92,40 @@ def _criar_sb() -> Client | None:
 
 def _janela_iso(dias: int) -> str:
     """Retorna timestamp ISO do início da janela de busca."""
-    dt = datetime.datetime.now() - datetime.timedelta(days=dias)
+    # Com fuso explícito: um horário "ingênuo" seria lido como UTC pelo
+    # Postgres do Supabase, deslocando a janela em 3h.
+    dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=dias)
     return dt.isoformat()
 
 
-def coletar_vagas(sb: Client, dias: int) -> list[dict]:
-    """Vagas novas com score > 0, ordenadas por score desc."""
+_COLUNAS_VAGAS_LEGADO = "cargo, fonte, tecnologias, links_candidatura, status_aplicacao, created_at"
+_COLUNAS_VAGAS_V3     = _COLUNAS_VAGAS_LEGADO + ", empresa, local, score_match, modelo_trabalho"
+
+
+def coletar_vagas(sb: Client, dias: int, limite: int = 100) -> list[dict]:
+    """
+    Vagas da janela, ordenadas por score desc. Tenta as colunas do schema v3
+    e cai para as antigas se o banco ainda não tiver a migração.
+    Usada também pelo gerar_dashboard.py.
+    """
     if not sb:
         return []
-    try:
-        res = (
-            sb.table("vagas_extraidas")
-            .select("cargo, fonte, tecnologias, links_candidatura, status_aplicacao, created_at")
-            .gte("created_at", _janela_iso(dias))
-            .order("created_at", desc=True)
-            .limit(50)
-            .execute()
-        )
-        return res.data or []
-    except Exception as e:
-        print(f"[WARN] coletar_vagas: {e}")
-        return []
+    for colunas in (_COLUNAS_VAGAS_V3, _COLUNAS_VAGAS_LEGADO):
+        try:
+            res = (
+                sb.table("vagas_extraidas")
+                .select(colunas)
+                .gte("created_at", _janela_iso(dias))
+                .order("created_at", desc=True)
+                .limit(limite)
+                .execute()
+            )
+            vagas = res.data or []
+            return sorted(vagas, key=lambda v: v.get("score_match") or 0, reverse=True)
+        except Exception as e:
+            ultimo_erro = e
+    print(f"[WARN] coletar_vagas: {ultimo_erro}")
+    return []
 
 
 def coletar_despesas(sb: Client, dias: int) -> list[dict]:
@@ -268,14 +248,19 @@ def _formatar_vagas(vagas: list[dict]) -> tuple[str, str]:
     # Agrupa por fonte
     por_fonte: dict[str, list] = {}
     for v in vagas:
-        f = v.get("fonte", "outro")
+        f = v.get("fonte") or "outro"
         por_fonte.setdefault(f, []).append(v)
 
     for fonte, items in sorted(por_fonte.items()):
         txt_linhas.append(f"  [{fonte.upper()}] {len(items)} vaga(s)")
-        html_linhas.append(f"<b>{fonte.upper()}</b> — {len(items)} vaga(s)<br>")
-        for v in items[:5]:   # máx 5 por fonte no briefing
-            cargo = v.get("cargo", "Cargo não identificado")[:55]
+        html_linhas.append(f"<b>{escape(fonte.upper())}</b> — {len(items)} vaga(s)<br>")
+        for v in items[:5]:   # máx 5 por fonte no briefing (já vêm ordenadas por score)
+            cargo = (v.get("cargo") or "Cargo não identificado")[:55]
+            empresa = v.get("empresa")
+            if empresa_conhecida(empresa):
+                cargo = f"{cargo} @ {empresa[:30]}"
+            score = v.get("score_match")
+            flag = "" if score is None else ("🔥 " if score >= 75 else "⚡ " if score >= 50 else "")
             links_raw = v.get("links_candidatura") or "[]"
             if isinstance(links_raw, str):
                 try:
@@ -287,12 +272,15 @@ def _formatar_vagas(vagas: list[dict]) -> tuple[str, str]:
             link = links[0] if links else None
             status = v.get("status_aplicacao", "nova")
 
-            txt_linhas.append(f"    · {cargo}  [{status}]")
+            score_txt = f" {score}%" if score else ""
+
+            txt_linhas.append(f"    · {flag}{cargo}{score_txt}  [{status}]")
             if link:
                 txt_linhas.append(f"      {link[:70]}")
 
-            html_cargo = f'<a href="{link}">{cargo}</a>' if link else cargo
-            html_linhas.append(f"&nbsp;&nbsp;• {html_cargo} <i>[{status}]</i><br>")
+            cargo_html = escape(cargo)
+            html_cargo = f'<a href="{escape(link, quote=True)}">{cargo_html}</a>' if link else cargo_html
+            html_linhas.append(f"&nbsp;&nbsp;• {flag}{html_cargo}{score_txt} <i>[{escape(str(status))}]</i><br>")
 
     return "\n".join(txt_linhas) + "\n", "".join(html_linhas)
 
@@ -303,12 +291,12 @@ def _formatar_despesas(despesas: list[dict]) -> tuple[str, str]:
     txt = []
     html = []
     for d in despesas:
-        est   = d.get("estabelecimento", "?")[:35]
-        val   = d.get("valor") or "—"
+        est   = (d.get("estabelecimento") or "?")[:35]
+        val   = formatar_reais(d.get("valor"))
         dt    = d.get("data_despesa") or "—"
-        cat   = d.get("categoria", "")
+        cat   = d.get("categoria") or ""
         txt.append(f"  · {est:<35}  {val:<12}  venc. {dt}")
-        html.append(f"<li><b>{est}</b> — {val} — venc. <b>{dt}</b> <i>({cat})</i></li>")
+        html.append(f"<li><b>{escape(est)}</b> — {val} — venc. <b>{escape(str(dt))}</b> <i>({escape(cat)})</i></li>")
     return "\n".join(txt) + "\n", "".join(html)
 
 
@@ -320,7 +308,7 @@ def _formatar_lista_simples(items: list[dict], campos: list[str]) -> tuple[str, 
         partes = [str(it.get(c, "")) for c in campos if it.get(c)]
         linha  = "  · " + "  |  ".join(partes[:3])
         txt.append(linha[:100])
-        html.append("<li>" + "  |  ".join(partes[:3])[:100] + "</li>")
+        html.append("<li>" + escape("  |  ".join(partes[:3])[:100]) + "</li>")
     return "\n".join(txt) + "\n", "".join(html)
 
 
@@ -334,7 +322,7 @@ def _formatar_comunicados(msgs: list[dict]) -> tuple[str, str]:
         snippet = m.get("snippet", "")[:80]
         txt.append(f"  · [{rem}] {assunto}")
         txt.append(f"    {snippet}")
-        html.append(f"<li><b>{rem}</b> — {assunto}<br><i>{snippet}</i></li>")
+        html.append(f"<li><b>{escape(rem)}</b> — {escape(assunto)}<br><i>{escape(snippet)}</i></li>")
     return "\n".join(txt) + "\n", "".join(html)
 
 
@@ -411,6 +399,8 @@ def montar_briefing(
     # ── Seções ───────────────────────────────────────────────────────────────
     tv, hv = _formatar_vagas(vagas)
     td, hd = _formatar_despesas(despesas)
+    # Registros antigos podem ter o código/link em claro — nunca vão para o e-mail
+    alertas = [{**a, "codigo_extraido": redigir_segredo(a.get("codigo_extraido"))} for a in alertas]
     ta, ha = _formatar_lista_simples(alertas,      ["plataforma", "tipo_alerta", "codigo_extraido"])
     tc, hc = _formatar_lista_simples(certificados, ["plataforma", "nome_curso",  "status_extracao"])
     tag, hag = _formatar_comunicados(agendamentos)
@@ -501,8 +491,8 @@ def main():
         help="Apenas imprime no terminal, não envia o e-mail",
     )
     parser.add_argument(
-        "--para", type=str, default="me",
-        help="Endereço de destino (padrão: próprio Gmail)",
+        "--para", type=str, default=DESTINATARIO,
+        help="Endereço de destino (padrão: BRIEFING_DESTINATARIO do .env ou o próprio Gmail)",
     )
     args = parser.parse_args()
 
@@ -517,7 +507,7 @@ def main():
     # Gmail
     try:
         service = _autenticar_gmail()
-    except FileNotFoundError as e:
+    except (FileNotFoundError, RuntimeError) as e:
         print(f"[ERRO] {e}")
         sys.exit(1)
 

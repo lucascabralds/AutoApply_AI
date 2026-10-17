@@ -47,3 +47,13 @@ client_secret_*.json
 .DS_Store
 Thumbs.db
 ehthumbs.db
+# ==========================================
+# Estado local do pipeline (contém dados dos seus e-mails)
+# ==========================================
+cache_gemini.json
+gemini_budget.json
+/certificados/
+.pytest_cache/
+/dados/
+/dashboard/index.html
+rota_ia_pausa.json

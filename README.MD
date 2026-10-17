@@ -1,7 +1,7 @@
 # AutoApply AI 🚀
 
 ## 🎯 Intenção do Projeto
-Este projeto é um pipeline inteligente de automação de e-mails desenvolvido para otimizar a gestão da caixa de entrada e acelerar o processo de candidaturas a vagas de emprego. Construído em **Python**, o sistema integra a **Gmail API**, **Google Drive API** e a inteligência artificial do **Google Gemini** para atuar como um assistente de carreira e segurança em segundo plano. 
+Este projeto é um pipeline inteligente de automação de e-mails desenvolvido para otimizar a gestão da caixa de entrada e acelerar o processo de candidaturas a vagas de emprego. Construído em **Python**, o sistema integra a **Gmail API**, **Google Drive API** e modelos de IA (via gateway **Rota.IA**) para atuar como um assistente de carreira e segurança em segundo plano. 
 
 O sistema não apenas resume comunicações diárias, mas realiza uma triagem ativa de oportunidades profissionais, decodifica links complexos de certificados, extrai códigos de segurança (OTP) de forma inteligente, valida requisitos e prepara o terreno para o envio automatizado de currículos focados em posições de tecnologia.
 
@@ -12,7 +12,7 @@ O algoritmo monitora ativamente a conta do Gmail e realiza a extração e o proc
   * IDs de mensagens e *threads*.
   * Extração do corpo do texto bruto (decodificando `base64url` e limpando tags HTML/CSS).
   * Metadados de anexos para extração direta de PDFs e Imagens.
-* **Inteligência de Vagas e Ofertas (Gemini API & Heurística):**
+* **Inteligência de Vagas e Ofertas (IA & Heurística):**
   * Capacidade de extrair **múltiplas vagas (N ofertas)** de um único e-mail (ex: Newsletters da Catho, Indeed, Infojobs).
   * Extração de **requisitos técnicos e comportamentais** solicitados na descrição.
   * Cruzamento das exigências capturadas com o perfil do candidato.
@@ -24,63 +24,138 @@ O algoritmo monitora ativamente a conta do Gmail e realiza a extração e o proc
   * Identificação de contexto via IA para descartar falsos positivos (como e-mails promocionais com "códigos de desconto").
 
 ## 🛠️ Stack e Integrações
-* **Linguagem Principal:** Python 3.x
-* **Integrações Google (GCP):** Gmail API (Leitura e Modificação) e Google Drive API.
-* **Inteligência Artificial:** Gemini API (`gemini-2.5-flash`).
-* **Bibliotecas Essenciais:** `google-api-python-client`, `google-auth-oauthlib`, `python-dotenv`, `requests`, `urllib.parse`.
+* **Linguagem Principal:** Python 3.10+
+* **Integrações Google (GCP):** Gmail API (leitura, labels e envio), Google Drive API e Google Tasks API (opcional).
+* **Inteligência Artificial:** gateway local [Rota.IA](https://github.com/lucascabralds/Rota-ia) (formato OpenAI-compatible), que escolhe o provedor (Gemini, OpenAI, Claude, Groq…) e faz fallback sozinho.
+* **Persistência:** Supabase (PostgreSQL).
+* **Notificações:** bot do Telegram (opcional).
 
 ---
 
-## 📂 Estrutura de Arquivos Principal
+## 📂 Estrutura de Arquivos
 
-* **`extrator_vagas_v2.py`**: Motor de extração focado em varrer a caixa de entrada, identificar plataformas de emprego e estruturar JSONs com múltiplas ofertas contidas no mesmo e-mail.
-* **`gmail_extrator_certificados.py`**: Script dedicado a buscar aprovações em cursos, baixar PDFs anexos ou extrair links de plataformas, salvando-os em um diretório local.
-* **`alerta_acessos.py`**: Assistente de segurança digital que monitora a entrada de OTPs, PINs e links de login temporários, validando a intenção do e-mail através do Gemini e imprimindo a credencial diretamente no terminal.
-* **`ai_engine.py`**: Módulo de integração com o Gemini para forçar saídas em JSON estrito e realizar a validação de *match* de perfil.
-* **`classifier.py`**: Filtro heurístico rápido para poupar tokens de IA, descartando falsos positivos (ex: e-mails de condomínio) antes de chamar o Gemini.
+| Arquivo | Papel |
+|---|---|
+| `main.py` | Orquestrador: vagas → certificados → alertas → e-mails gerais, com labels no Gmail e gravação no Supabase. |
+| `briefing_diario.py` | Briefing matinal: resume as últimas 24h (vagas por score, despesas, agendamentos, alertas) e envia para o seu Gmail. |
+| `gemini_service.py` | Prompts e parse robusto do JSON da IA (cercas de markdown, vírgulas soltas, respostas truncadas). |
+| `rota_ia_client.py` | Cliente HTTP do gateway Rota.IA com retry em 429/503. |
+| `google_auth.py` | OAuth2 único para todos os scripts (um só `token.json`, com todos os escopos). |
+| `gerar_dashboard.py` + `dashboard/template.html` | Dashboard HTML com os dados reais do Supabase (vagas por score, candidaturas, tecnologias, despesas, certificados). |
+| `diagnostico.py` | Confere toda a configuração (arquivos, escopos do token, Rota.IA, tabelas do Supabase, Telegram) e diz o que falta. |
+| `agendador.py` | Roda alertas, pipeline e briefing em horários definidos (usado no Docker). |
+| `calendario.py` | Vencimentos e agendamentos → eventos no Google Calendar (com lembrete). |
+| `notificador.py` | Envio de mensagens pelo Telegram. |
+| `seguranca.py` | Redação de OTPs e links de recuperação antes de gravar/enviar. |
+| `candidatura.py` | Rascunhos de candidatura no Gmail: carta gerada pela IA a partir do perfil + currículo anexado. |
+| `services/gmail/add_task.py` | Follow-ups de vagas no Google Tasks. |
+| `supabase/schema.sql` | Schema idempotente de todas as tabelas. |
+| `tests/` | Testes automatizados (`pytest`), rodando no GitHub Actions. |
+| Demais arquivos em `services/` | Protótipos anteriores, mantidos como referência (não são usados pelo `main.py`). |
 
 ---
 
-## ⚙️ Pré-requisitos e Configuração de Ambiente
+## ⚙️ Configuração
 
 ### 1. Dependências
-Crie um ambiente virtual e instale as dependências listadas:
 ```bash
 python -m venv venv
-source venv/bin/activate  # No Windows: venv\Scripts\activate
-pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib google-generativeai python-dotenv requests
+source venv/bin/activate        # No Windows: venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-### 2. Variáveis de Ambiente (`.env`)
-O projeto utiliza um arquivo `.env` para proteger credenciais e configurar diretórios locais. 
+### 2. Google Cloud
+1. Crie um projeto no [Google Cloud Console](https://console.cloud.google.com/) e habilite **Gmail API** e **Google Drive API** (e **Google Tasks API** / **Google Calendar API**, se for usar follow-ups e eventos).
+2. Crie uma credencial OAuth do tipo *Desktop* e salve como `credentials.json` na raiz do projeto.
+3. Na primeira execução o navegador abre para autorizar. O `token.json` gerado é compartilhado por todos os scripts.
 
-1. Na raiz do projeto, faça uma cópia do arquivo de modelo:
+### 3. Supabase
+Abra o **SQL Editor** do seu projeto e rode o conteúdo de [`supabase/schema.sql`](supabase/schema.sql). O script é idempotente: cria o que falta e adiciona as colunas novas sem apagar dados — rode de novo sempre que atualizar o projeto.
+
+> Sem a migração o pipeline continua funcionando no formato antigo (uma linha por e-mail) e avisa no terminal.
+
+### 4. Variáveis de ambiente
 ```bash
 cp .env.example .env
 ```
-2. Abra o arquivo `.env` recém-criado e preencha com as suas informações reais (API Key do Gemini e o caminho da sua pasta local).
+Preencha pelo menos `ROTA_IA_API_KEY`, `SUPABASE_URL` e `SUPABASE_KEY`. Todas as opções estão comentadas no [`.env.example`](.env.example).
+
+### 5. Telegram (opcional)
+Crie um bot com o [@BotFather](https://t.me/BotFather), preencha `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID` e teste com `python notificador.py "olá"`.
+
+---
+
+## 🚀 Uso
+
+```bash
+python diagnostico.py              # confere .env, token, Rota.IA, Supabase e Telegram antes de tudo
+python main.py                     # todos os módulos, e-mails das últimas 24h
+python main.py --dias 7            # amplia a janela
+python main.py --modulo vagas      # vagas | certificados | alertas | geral
+python main.py --dry-run           # não grava nada (Supabase/Drive/Telegram)
+python main.py --modulo alertas --intervalo 60   # fica de plantão: OTPs no celular em ~1 min
+
+python briefing_diario.py --preview   # imprime o briefing no terminal
+python briefing_diario.py             # envia o briefing para o seu Gmail
+
+python gerar_dashboard.py --abrir     # gera dashboard/index.html e abre no navegador
+```
+
+### 🐳 Rodando sozinho (Docker)
+O `agendador.py` mantém tudo no ar sem cron: alertas a cada 1 min, pipeline completo a cada 30 min e o briefing todo dia às 07:30 (ajuste com `ALERTAS_INTERVALO_MIN`, `PIPELINE_INTERVALO_MIN` e `BRIEFING_HORARIO`).
+
+```bash
+python google_auth.py                       # 1x, na sua máquina: gera o token.json
+mkdir dados && cp credentials.json token.json dados/
+docker compose up -d --build
+docker compose logs -f          # o dashboard fica em ./dados/dashboard.html
+```
+O container roda em modo headless (nunca tenta abrir navegador) e acessa o Rota.IA da máquina host via `host.docker.internal`. Sem Docker, `python agendador.py` faz o mesmo.
+
+Para rodar os testes:
+```bash
+pip install -r requirements-dev.txt
+pytest -q
+```
 
 ---
 
 ## 🏷️ Sistema de Marcadores (Labels) no Gmail
-Para evitar processamento duplicado, o sistema interage diretamente com as *labels* do usuário, criando e atribuindo categorias automaticamente:
+O `main.py` cria a hierarquia abaixo e aplica sempre a label pai + a sub-label. E-mails com qualquer label `AutoApply/*` não são processados de novo.
 
-* 🔴 **`Certificado_Extraido`**: Aplicado quando o script consegue baixar o anexo (PDF/IMG) ou extrai e salva com sucesso a URL limpa de um certificado.
-* 🟢 **`Certificados_Pendentes`**: Aplicado quando um e-mail de certificado é detectado, mas exige intervenção humana (ex: falha no download, link quebrado ou necessidade de login complexo).
-* *O script ignora automaticamente qualquer e-mail que já possua uma dessas duas etiquetas.*
+```
+AutoApply/Vagas/Alta_Prioridade      score ≥ 75
+AutoApply/Vagas/Baixa_Prioridade     score < 75
+AutoApply/Certificados/Extraido      arquivo salvo no Drive
+AutoApply/Certificados/Pendente      requer ação manual
+AutoApply/Alertas/OTP                código numérico / novo login
+AutoApply/Alertas/Recuperacao        link de recuperação de senha
+AutoApply/Geral/Agendamento          confirmações, reservas
+AutoApply/Geral/Financeiro           faturas, boletos, recibos
+AutoApply/Geral/Comunicado           avisos de empresas e bancos
+AutoApply/Geral/Servicos             demais notificações
+AutoApply/Geral/Veiculo              Detran, IPVA, licenciamento, multas, CNH
+```
 
 ---
 
-## 🚀 Sugestões de Melhorias Futuras (Roadmap)
+## 🗺️ Roadmap
 
-Para as próximas fases de evolução arquitetural, considera-se a implementação de:
+**Concluído**
+- [x] Persistência no Supabase com uma linha por vaga (score, empresa, modelo, salário, requisitos)
+- [x] Notificações push no Telegram para OTPs e vagas de alta prioridade
+- [x] Follow-ups automáticos de vagas no Google Tasks
+- [x] Briefing diário por e-mail
+- [x] Testes automatizados + CI
+- [x] Monitoramento automotivo e vencimentos: Detran/IPVA/licenciamento/multas com label própria, gravados como despesa e, com o Calendar ligado, boletos e agendamentos viram eventos com lembrete
+- [x] Rascunhos de candidatura (Fase 3, com revisão humana): carta personalizada + currículo anexado, endereçada ao recrutador quando o e-mail aparece na vaga
+- [x] Dashboard com dados reais do Supabase (antes: protótipo com dados fictícios)
+- [x] Docker + agendador (alertas a cada minuto, pipeline a cada 30 min, briefing diário)
+- [x] Status de candidatura: "sua candidatura foi enviada" / "você avançou de fase" atualizam a vaga existente (nova → aplicada → em_processo → reprovada/aprovada), sem duplicar
 
-1. **Automação de Finanças e Despesas Domésticas:** Integrar um filtro no Gmail para identificar notas fiscais, faturas e comprovantes de contas de consumo (luz, internet). O Gemini irá extrair os dados e inseri-los automaticamente em uma tabela dedicada no banco de dados (Supabase), permitindo o cruzamento com planilhas financeiras preexistentes.
-2. **Monitoramento Automotivo e Burocrático:** Implementar um módulo para varrer notificações de órgãos de trânsito (ex: Detran), referentes a CNH, IPVA, licenciamento e seguros. O assistente irá extrair datas de vencimento e valores, injetando alertas automaticamente no Google Calendar e salvando os documentos no Google Drive.
-3. **Notificações Push (Webhooks):** Integrar o `alerta_acessos.py` com a API do Telegram ou Discord. Assim, ao invés de exibir os códigos OTP apenas no terminal, o sistema enviaria o PIN diretamente para o smartphone, acelerando o fluxo de login em serviços de terceiros.
-4. **Containerização (Docker):** Criar um `Dockerfile` e um `docker-compose.yml` para isolar a aplicação, facilitando o deploy e a configuração de *cron jobs* para rodar a automação periodicamente em servidores ou instâncias de nuvem.
-5. **Persistência em Banco de Dados:** Substituir a exportação de arquivos TXT e agrupamentos em memória por um banco de dados relacional (como PostgreSQL ou SQLite via Supabase) para criar um histórico robusto das empresas que mais enviaram vagas e mapear tendências de tecnologias solicitadas.
-6. **Disparo Automatizado (`messages.send`):** Finalizar a **Fase 3** do projeto construindo a funcionalidade que anexa o currículo estruturado e realiza a candidatura ativa utilizando o protocolo MIME da Gmail API.
+**Próximos passos**
+1. **Automação de Finanças:** cruzar `despesas_domesticas` com as planilhas financeiras existentes.
+2. **Envio automático opcional** dos rascunhos de candidatura, depois de algumas semanas validando a qualidade das cartas.
 
 ---
 

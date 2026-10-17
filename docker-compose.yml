@@ -1,0 +1,24 @@
+# Sobe o AutoApply AI em segundo plano:
+#   1. python google_auth.py          (na sua máquina, gera o token.json)
+#   2. mkdir dados && cp credentials.json token.json dados/
+#   3. docker compose up -d --build
+#   4. docker compose logs -f
+services:
+  autoapply:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    # `environment` tem precedência sobre o .env — estes valores valem só no container
+    environment:
+      # O gateway Rota.IA roda na máquina host, fora do container
+      ROTA_IA_URL: ${ROTA_IA_URL_DOCKER:-http://host.docker.internal:8787/v1}
+      AUTOAPPLY_HEADLESS: "true"
+      AUTOAPPLY_DADOS_DIR: /app/dados
+      GMAIL_CREDENTIALS_PATH: /app/dados/credentials.json
+      GMAIL_TOKEN_PATH: /app/dados/token.json
+      # Abra ./dados/dashboard.html no navegador da sua máquina
+      DASHBOARD_SAIDA: /app/dados/dashboard.html
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./dados:/app/dados
