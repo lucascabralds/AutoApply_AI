@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
+import console
+
 load_dotenv()
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -95,6 +97,7 @@ def executar(tarefa: Tarefa) -> int:
 
 
 def main() -> None:
+    console.preparar_console()
     tarefas = montar_tarefas(datetime.datetime.now())
     print("AutoApply AI — agendador iniciado")
     for t in tarefas:

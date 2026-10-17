@@ -38,6 +38,7 @@ load_dotenv()
 from googleapiclient.errors import HttpError
 import base64
 
+import console
 import google_auth
 from formatacao import empresa_conhecida, formatar_reais
 from seguranca import redigir_segredo
@@ -673,6 +674,7 @@ def main():
         help="Endereço de destino (padrão: BRIEFING_DESTINATARIO do .env ou o próprio Gmail)",
     )
     args = parser.parse_args()
+    console.preparar_console()
 
     print(f"\n{'='*54}")
     print(f"  AutoApply AI — Briefing Matinal")

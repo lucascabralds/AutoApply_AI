@@ -20,6 +20,8 @@ from dataclasses import dataclass
 import requests
 from dotenv import load_dotenv
 
+import console
+
 load_dotenv()
 
 OK, AVISO, ERRO = "OK", "AVISO", "ERRO"
@@ -194,6 +196,7 @@ def main() -> None:
     parser.add_argument("--sem-rede", action="store_true", help="Só verificações locais")
     parser.add_argument("--json", action="store_true", help="Saída em JSON")
     args = parser.parse_args()
+    console.preparar_console()
 
     resultados = executar(com_rede=not args.sem_rede)
     if args.json:

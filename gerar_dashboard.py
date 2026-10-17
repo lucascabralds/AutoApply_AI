@@ -25,6 +25,7 @@ import webbrowser
 
 from dotenv import load_dotenv
 
+import console
 from briefing_diario import coletar_vagas
 from formatacao import empresa_conhecida, formatar_reais
 
@@ -187,6 +188,7 @@ def main() -> None:
     parser.add_argument("--saida", default=SAIDA_PADRAO, help="Arquivo HTML gerado")
     parser.add_argument("--abrir", action="store_true", help="Abre o dashboard no navegador ao final")
     args = parser.parse_args()
+    console.preparar_console()
 
     url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
     chave = os.getenv("SUPABASE_KEY")

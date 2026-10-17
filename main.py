@@ -59,6 +59,7 @@ from bs4 import BeautifulSoup
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload
 
+import console
 import google_auth
 from notificador import enviar_telegram, escapar_html, telegram_configurado
 from formatacao import empresa_conhecida, formatar_reais
@@ -390,6 +391,12 @@ class Log:
     @staticmethod
     def _ts():
         return datetime.datetime.now().strftime("%H:%M:%S")
+
+    @classmethod
+    def sem_cores(cls):
+        """Saída em arquivo/pipe (agendador, Agendador de Tarefas): sem códigos ANSI."""
+        for attr in ("RESET", "BOLD", "GREEN", "BLUE", "YELLOW", "RED", "CYAN", "GRAY"):
+            setattr(cls, attr, "")
 
     @classmethod
     def info(cls, msg):
@@ -2562,6 +2569,10 @@ def main():
         ),
     )
     args = parser.parse_args()
+
+    console.preparar_console()
+    if not console.cores_ativas():
+        Log.sem_cores()
 
     inicio = datetime.datetime.now()
     query  = f"newer_than:{args.dias}d"
