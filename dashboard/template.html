@@ -255,7 +255,7 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt
 const url = u => /^https?:\/\//i.test(u || '') ? esc(u) : null;
 const scoreCls = s => s >= 75 ? 'high' : s >= 50 ? 'mid' : 'low';
 const modeloCls = m => m === 'Remoto' ? 'badge-remote' : m === 'Híbrido' ? 'badge-hybrid' : m === 'Presencial' ? 'badge-onsite' : 'badge-neutral';
-const STATUS = {nova:'nova', aplicada:'aplicada', em_processo:'em processo', reprovada:'reprovada', aprovada:'aprovada'};
+const STATUS = {nova:'nova', aplicada:'aplicada', em_processo:'em processo', reprovada:'reprovada', aprovada:'aprovada', descartada:'descartada'};
 const vazio = msg => `<div class="empty">${msg}</div>`;
 
 function showPage(name, el) {
@@ -333,7 +333,7 @@ function setFilter(el, f) {
 }
 
 function renderCandidaturas() {
-  const c = DADOS.vagas.filter(v => v.status !== 'nova');
+  const c = DADOS.vagas.filter(v => v.status !== 'nova' && v.status !== 'descartada');
   document.getElementById('timeline').innerHTML = c.length ? c.map(v =>
     `<div class="tl-item"><div class="tl-dot ${esc(v.status)}"></div><div class="tl-date">${esc(v.data)}</div>`
     + `<div class="tl-cargo">${esc(v.cargo)}</div><div class="tl-empresa">${esc(v.empresa || '—')}</div>`

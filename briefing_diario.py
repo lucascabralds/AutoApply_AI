@@ -109,7 +109,7 @@ def _janela_iso(dias: int) -> str:
     return dt.isoformat()
 
 
-_COLUNAS_VAGAS_LEGADO = "cargo, fonte, tecnologias, links_candidatura, status_aplicacao, created_at"
+_COLUNAS_VAGAS_LEGADO = "id, cargo, fonte, tecnologias, links_candidatura, status_aplicacao, created_at"
 _COLUNAS_VAGAS_V3     = _COLUNAS_VAGAS_LEGADO + ", empresa, local, score_match, modelo_trabalho, tipo_email"
 _COLUNAS_VAGAS_V4     = _COLUNAS_VAGAS_V3 + ", motivos_match"
 
@@ -200,7 +200,7 @@ def coletar_certificados(sb: Client, dias: int) -> list[dict]:
 # PRIORIZAÇÃO: o que fazer hoje com as vagas
 # ===========================================================================
 
-_ORDEM_FUNIL = ["nova", "aplicada", "em_processo", "aprovada", "reprovada"]
+_ORDEM_FUNIL = ["nova", "aplicada", "em_processo", "aprovada", "reprovada", "descartada"]
 
 
 def _lista(valor) -> list:
@@ -304,7 +304,8 @@ def _formatar_aplicar_hoje(vagas: list[dict]) -> tuple[str, str]:
         link = links[0] if links else None
         motivos = ", ".join(str(m) for m in _lista(v.get("motivos_match"))[:4])
 
-        txt.append(f"  {i}. {cargo} — {score}%" + (f"  ({detalhes})" if detalhes else ""))
+        vaga_id = f"#{v['id']} " if v.get("id") is not None else ""
+        txt.append(f"  {i}. {vaga_id}{cargo} — {score}%" + (f"  ({detalhes})" if detalhes else ""))
         if motivos:
             txt.append(f"     por quê: {motivos}")
         txt.append(f"     {link}" if link else "     (sem link — procure a vaga na plataforma de origem)")
@@ -313,18 +314,22 @@ def _formatar_aplicar_hoje(vagas: list[dict]) -> tuple[str, str]:
         if link:
             titulo = f'<a href="{escape(link, quote=True)}">{titulo}</a>'
         html.append(
-            f"<li><b>{titulo}</b> — {score}%"
+            f"<li>{escape(vaga_id)}<b>{titulo}</b> — {score}%"
             + (f" <i>({escape(detalhes)})</i>" if detalhes else "")
             + (f'<br><span style="color:#7a82a0">por quê: {escape(motivos)}</span>' if motivos else "")
             + "</li>"
         )
+    dica = "Já se candidatou? python vagas.py aplicar <#>  ·  Sem interesse? python vagas.py descartar <#>"
+    txt.append(f"  {dica}")
+    html.append(f'<li style="color:#7a82a0">{escape(dica)}</li>')
     return "\n".join(txt) + "\n", "".join(html)
 
 
 def _formatar_funil(funil: dict) -> tuple[str, str]:
     c = funil["contagem"]
     linha = (f"nova {c['nova']} → aplicada {c['aplicada']} → em processo {c['em_processo']} → "
-             f"aprovada {c['aprovada']}  |  reprovada {c['reprovada']}")
+             f"aprovada {c['aprovada']}  |  reprovada {c['reprovada']}"
+             + (f"  |  descartada {c['descartada']}" if c.get("descartada") else ""))
     taxa = funil.get("taxa_resposta")
     linha_taxa = (f"Taxa de resposta: {taxa}% de {funil['candidaturas']} candidatura(s)"
                   if taxa is not None else "Nenhuma candidatura registrada ainda.")

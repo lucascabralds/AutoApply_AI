@@ -48,6 +48,7 @@ O algoritmo monitora ativamente a conta do Gmail e realiza a extração e o proc
 | `notificador.py` | Envio de mensagens pelo Telegram. |
 | `seguranca.py` | Redação de OTPs e links de recuperação antes de gravar/enviar. |
 | `match_vagas.py` | Score de aderência da vaga ao perfil, explicável ("+50 área-alvo: dados", "-25 nível sênior"), combinado com o score da IA. |
+| `vagas.py` | Linha de comando do funil: lista vagas e marca candidaturas feitas por fora (`aplicar`, `descartar`, `status`) pelo número #id do briefing. |
 | `candidatura.py` | Rascunhos de candidatura no Gmail: carta gerada pela IA a partir do perfil + currículo anexado. |
 | `services/gmail/add_task.py` | Follow-ups de vagas no Google Tasks. |
 | `supabase/schema.sql` | Schema idempotente de todas as tabelas. |
@@ -100,6 +101,11 @@ python briefing_diario.py --preview   # imprime o briefing no terminal
 python briefing_diario.py             # envia o briefing para o seu Gmail
 
 python gerar_dashboard.py --abrir     # gera dashboard/index.html e abre no navegador
+
+python vagas.py listar                # vagas novas (7 dias), maior score primeiro, com o porquê
+python vagas.py aplicar 123           # já me candidatei → sai do "Aplicar hoje" e entra no funil
+python vagas.py descartar 124         # sem interesse
+python vagas.py status 123 em_processo
 ```
 
 ### 🐳 Rodando sozinho (Docker)

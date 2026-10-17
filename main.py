@@ -1032,7 +1032,8 @@ def salvar_vaga(sb: Client | None, vaga: dict, dry_run: bool = False) -> bool:
 
 # Funil de candidatura — o status de uma vaga só avança, nunca regride
 # (um "retorno" atrasado não pode desfazer um "avançou de fase").
-_ORDEM_STATUS = {"nova": 0, "aplicada": 1, "em_processo": 2, "reprovada": 3, "aprovada": 3}
+# "descartada" (marcada à mão com vagas.py) volta ao funil se chegar "candidatura enviada".
+_ORDEM_STATUS = {"nova": 0, "descartada": 0, "aplicada": 1, "em_processo": 2, "reprovada": 3, "aprovada": 3}
 
 
 def _status_do_email(tipo_email: str | None, status_candidatura: str | None) -> str:
