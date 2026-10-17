@@ -127,3 +127,33 @@ def test_anexo_com_content_id_mas_disposition_attachment_nao_e_inline():
     logo = {"filename": "l.png", "mimeType": "image/png", "headers": [{"name": "Content-ID", "value": "<x>"}]}
     assert not main._eh_inline(pdf)
     assert main._eh_inline(logo)
+
+
+def test_subcategorias_casam_palavra_inteira():
+    assert main._detectar_subcategoria_financeiro("Cobrança pendente: segue o documento") == "cobranca"
+    assert main._detectar_subcategoria_financeiro("Você recebeu um Pix") == "pix"
+    assert main._detectar_subcategoria_financeiro("Seu TED foi concluído") == "pix"
+    assert main._detectar_subcategoria_veiculo("multas pendentes no detran") == "veiculo_multa"
+
+
+def test_veiculo_cobre_variacoes_comuns():
+    assert main._categoria_heuristica("Seu seguro automóvel vence em 10/11", "") == "veiculo"
+    assert main._categoria_heuristica("Licenciamento de veículo 2026", "") == "veiculo"
+
+
+def test_como_bool():
+    assert main._como_bool("false") is False and main._como_bool("Sim") is True
+    assert main._como_bool(True) is True and main._como_bool(None) is False
+
+
+def test_falha_de_ia_repetida_vira_heuristica_na_extracao(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "_GEMINI_CACHE", {})
+    monkeypatch.setattr(main, "_CACHE_PATH", str(tmp_path / "c.json"))
+    monkeypatch.setattr(main, "_BUDGET_PATH", str(tmp_path / "b.json"))
+    monkeypatch.setattr(main, "gateway_disponivel", lambda: True)
+    monkeypatch.setattr(main, "_status_ia", lambda: "falha")
+    monkeypatch.setattr(main, "_gs_extrair_vagas", lambda *a, **k: [])
+    resultados = [main.extrair_vagas_pipeline("Vaga Dev", "x@y.com", "python", "m9")
+                  for _ in range(main.MAX_TENTATIVAS_IA)]
+    assert resultados[:-1] == [None] * (main.MAX_TENTATIVAS_IA - 1)
+    assert resultados[-1][0]["cargo"] == "Vaga Dev" and resultados[-1][0]["score_match"] == 0

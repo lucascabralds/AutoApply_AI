@@ -56,38 +56,61 @@ PAUSA_SEG    = int(os.getenv("ROTA_IA_PAUSA_SEG", "300"))
 _DADOS_DIR   = os.getenv("AUTOAPPLY_DADOS_DIR") or os.path.dirname(os.path.abspath(__file__))
 _PAUSA_PATH  = os.path.join(_DADOS_DIR, "rota_ia_pausa.json")
 
-_cache_pausa: tuple[float, float] = (-1.0, 0.0)   # (mtime do arquivo, pausado_ate)
+# Estado do breaker em disco: {"pausado_ate": epoch, "timeouts": n}
+_cache_estado: tuple[tuple, dict] = ((), {})   # (assinatura do arquivo, conteúdo)
+TIMEOUTS_PARA_PAUSAR = 2
 
 
 class GatewayIndisponivel(RuntimeError):
     """O Rota.IA não respondeu nas últimas chamadas; nova tentativa só após a pausa."""
 
 
-def _pausado_ate() -> float:
-    """Lê a pausa do disco só quando o arquivo muda (é consultada várias vezes por e-mail)."""
-    global _cache_pausa
+def _assinatura() -> tuple:
+    """(caminho, mtime_ns, tamanho) — muda a cada escrita, inclusive no mesmo segundo."""
+    st = os.stat(_PAUSA_PATH)
+    return (_PAUSA_PATH, st.st_mtime_ns, st.st_size)
+
+
+def _ler_estado() -> dict:
+    """Lê o estado do disco só quando o arquivo muda (é consultado várias vezes por e-mail)."""
+    global _cache_estado
     try:
-        mtime = os.path.getmtime(_PAUSA_PATH)
+        assinatura = _assinatura()
     except OSError:
-        return 0.0
-    if mtime != _cache_pausa[0]:
+        return {}
+    if assinatura != _cache_estado[0]:
         try:
             with open(_PAUSA_PATH, encoding="utf-8") as f:
-                _cache_pausa = (mtime, float(json.load(f).get("pausado_ate", 0)))
-        except (OSError, ValueError, AttributeError):
-            _cache_pausa = (mtime, 0.0)
-    return _cache_pausa[1]
+                conteudo = json.load(f)
+            _cache_estado = (assinatura, conteudo if isinstance(conteudo, dict) else {})
+        except (OSError, ValueError):
+            _cache_estado = (assinatura, {})
+    return _cache_estado[1]
+
+
+def _gravar_estado(estado: dict) -> None:
+    global _cache_estado
+    try:
+        if any(estado.values()):
+            with open(_PAUSA_PATH, "w", encoding="utf-8") as f:
+                json.dump(estado, f)
+            _cache_estado = (_assinatura(), dict(estado))
+        elif os.path.exists(_PAUSA_PATH):
+            os.remove(_PAUSA_PATH)
+            _cache_estado = ((), {})
+    except OSError:
+        pass
+
+
+def _pausado_ate() -> float:
+    try:
+        return float(_ler_estado().get("pausado_ate", 0))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _gravar_pausa(ate: float) -> None:
-    try:
-        if ate:
-            with open(_PAUSA_PATH, "w", encoding="utf-8") as f:
-                json.dump({"pausado_ate": ate}, f)
-        elif os.path.exists(_PAUSA_PATH):
-            os.remove(_PAUSA_PATH)
-    except OSError:
-        pass
+    _gravar_estado({"pausado_ate": ate, "timeouts": 0})
 
 
 def gateway_disponivel() -> bool:
@@ -103,9 +126,23 @@ def _registrar_falha_de_conexao() -> None:
     )
 
 
+def _registrar_timeout() -> None:
+    """
+    Um timeout isolado é provedor lento; TIMEOUTS_PARA_PAUSAR chamadas
+    seguidas estourando o tempo é gateway travado (porta aberta, sem
+    resposta) — aí pausa como se estivesse fora do ar.
+    """
+    estado = _ler_estado()
+    timeouts = int(estado.get("timeouts", 0)) + 1
+    if timeouts >= TIMEOUTS_PARA_PAUSAR:
+        _registrar_falha_de_conexao()
+    else:
+        _gravar_estado({"pausado_ate": estado.get("pausado_ate", 0), "timeouts": timeouts})
+
+
 def _registrar_sucesso() -> None:
-    if _pausado_ate():
-        _gravar_pausa(0)
+    if _ler_estado():
+        _gravar_estado({})
 
 
 def _extrair_retry_delay(texto: str) -> float:
@@ -180,9 +217,11 @@ def chamar_ia(prompt: str, max_tentativas: int = 3, temperature: float = 0.1,
         except (requests.ConnectionError, requests.Timeout) as exc:
             ultima_exc = exc
             if tentativa == max_tentativas:
-                # ReadTimeout = conectou mas o provedor demorou; ConnectTimeout
-                # (subclasse de ConnectionError) = gateway inalcançável → pausa
-                if not isinstance(exc, requests.ReadTimeout):
+                # ReadTimeout = conectou mas não respondeu a tempo (conta, e pausa
+                # se repetir); ConnectTimeout/ConnectionError = inalcançável → pausa
+                if isinstance(exc, requests.ReadTimeout):
+                    _registrar_timeout()
+                else:
                     _registrar_falha_de_conexao()
                 break
             logger.warning(

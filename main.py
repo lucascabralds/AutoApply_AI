@@ -1266,6 +1266,27 @@ def _cache_set(tipo: str, msg_id: str, valor, permitir_vazio: bool = False) -> N
 # módulo de gerais não os etiqueta, para o de vagas tentar de novo depois.
 _PENDENTES_IA: set[str] = set()
 
+# Uma falha da IA num e-mail deixa ele para a próxima execução — mas só
+# algumas vezes: se a falha for permanente (chave errada, prompt rejeitado,
+# resposta sempre ilegível) o e-mail cai para a heurística em vez de ser
+# retentado para sempre e sumir da janela de busca sem nunca ser salvo.
+MAX_TENTATIVAS_IA = int(os.getenv("MAX_TENTATIVAS_IA", "3"))
+
+
+def _pode_retentar(tipo: str, msg_id: str) -> bool:
+    """
+    Registra mais uma falha da IA para (tipo, e-mail). True enquanto vale
+    deixar para depois; False quando já falhou MAX_TENTATIVAS_IA vezes
+    ou o gateway está pausado e o e-mail não tem id.
+    """
+    if not msg_id:
+        return False
+    chave = _cache_key(f"falhas_{tipo}", msg_id)
+    falhas = int(_GEMINI_CACHE.get(chave, 0)) + 1
+    _GEMINI_CACHE[chave] = falhas
+    _salvar_cache(_GEMINI_CACHE)
+    return falhas < MAX_TENTATIVAS_IA
+
 
 def classificar_email_pipeline(assunto: str, remetente: str, corpo_preview: str,
                                msg_id: str = "") -> str:
@@ -1321,10 +1342,12 @@ def classificar_email_pipeline(assunto: str, remetente: str, corpo_preview: str,
             _cache_set("classif", msg_id, resultado)
             return resultado
 
-    # IA indisponível agora: o e-mail pode ser uma vaga — fica pendente
-    if msg_id:
+    # IA indisponível/falhou: o e-mail pode ser uma vaga — fica pendente
+    # (até MAX_TENTATIVAS_IA vezes; depois segue como "outro")
+    if _pode_retentar("classif", msg_id):
         _PENDENTES_IA.add(msg_id)
-    return "indeterminado"
+        return "indeterminado"
+    return "outro"
 
 
 def _vaga_heuristica(assunto: str, remetente: str, corpo: str,
@@ -1385,8 +1408,11 @@ def extrair_vagas_pipeline(assunto: str, remetente: str, corpo: str,
             return resultado
 
     # Sem IA agora: o e-mail fica sem label e é reprocessado depois (sem gastar budget)
-    Log.warn("  ⚠ Rota.IA indisponível — e-mail fica para a próxima execução")
-    return None
+    if _pode_retentar("vagas", msg_id):
+        Log.warn("  ⚠ IA indisponível/falhou — e-mail fica para a próxima execução")
+        return None
+    Log.warn(f"  ⚠ IA falhou {MAX_TENTATIVAS_IA}x neste e-mail — usando heurística")
+    return [_vaga_heuristica(assunto, remetente, corpo, ancoras)]
 
 
 def analisar_acesso_pipeline(remetente: str, assunto: str, corpo: str,
@@ -1428,7 +1454,8 @@ def classificar_geral_pipeline(remetente: str, assunto: str, corpo: str,
 
     resultado = _gs_classificar_geral(remetente, assunto, corpo)
     if _status_ia() != "ok":
-        return None
+        # Falha pontual → tenta de novo depois; falha repetida → segue só com a heurística
+        return None if _pode_retentar("geral", msg_id) else {}
     _consumir_budget("geral")
     _cache_set("geral", msg_id, resultado)
     return resultado
@@ -2080,10 +2107,10 @@ def rodar_alertas(service, labels: dict, sb: Client | None, query_dias: int, dry
 # "pagamento seguro automático", nem "licenciamento" com licença de software.
 _PADROES_VEICULO = re.compile(
     r"\b(detran|ipva|crlv|renavam|dpvat|semparar|conectcar|veloe"
-    r"|licenciamento (?:anual|do ve[ií]culo|\d{4})"
+    r"|licenciamento (?:anual|d[eo] ve[ií]culo|\d{4})"
     r"|multa de tr[aâ]nsito|auto de infra[cç][aã]o|notifica[cç][aã]o de autua[cç][aã]o|infra[cç][aã]o de tr[aâ]nsito"
     r"|carteira nacional de habilita[cç][aã]o|renova[cç][aã]o da cnh"
-    r"|seguro auto|vistoria veicular)\b"
+    r"|seguro (?:auto|autom[oó]vel|d[eo] (?:carro|ve[ií]culo|moto))|vistoria veicular)\b"
 )
 
 _PADROES_GERAL = {
@@ -2122,24 +2149,29 @@ _PADROES_GERAL = {
 _SUBCATEGORIA_VEICULO = {
     "veiculo_ipva":          ["ipva"],
     "veiculo_licenciamento": ["licenciamento", "crlv", "dpvat"],
-    "veiculo_multa":         ["multa", "infração", "infracao", "autuação", "autuacao"],
+    "veiculo_multa":         ["multa", "multas", "infração", "infracao", "autuação", "autuacao"],
     "veiculo_cnh":           ["cnh", "habilitação", "habilitacao"],
     "veiculo_seguro":        ["seguro"],
     "veiculo_pedagio":       ["semparar", "conectcar", "veloe", "pedágio", "pedagio"],
 }
 
 _SUBCATEGORIA_FINANCEIRO = {
-    "boleto_fatura": ["boleto", "fatura", "vence", "vencimento", "valor a pagar", "emitido por"],
+    "boleto_fatura": ["boleto", "fatura", "vence", "vencimento", "valor a pagar", "emitido por", "pagar até"],
     "pix":           ["pix", "transferência", "ted", "doc"],
     "recibo":        ["comprovante", "recibo", "nfe", "nota fiscal"],
     "assinatura":    ["assinatura", "renovação", "google play", "renovada"],
-    "cobranca":      ["cobrança", "debito", "crédito"],
+    "cobranca":      ["cobrança", "cobranca", "débito", "debito", "crédito", "pendente"],
 }
+
+def _contem_termo(texto: str, termos: list[str]) -> bool:
+    """Casa termos como palavra inteira — "doc" não pode casar com "documento", nem "ted" com "conectado"."""
+    return any(re.search(r"(?<!\w)" + re.escape(t) + r"(?!\w)", texto) for t in termos)
+
 
 def _detectar_subcategoria_veiculo(texto: str) -> str:
     txt = texto.lower()
     for sub, palavras in _SUBCATEGORIA_VEICULO.items():
-        if any(p in txt for p in palavras):
+        if _contem_termo(txt, palavras):
             return sub
     return "veiculo_outros"
 
@@ -2147,9 +2179,16 @@ def _detectar_subcategoria_veiculo(texto: str) -> str:
 def _detectar_subcategoria_financeiro(texto: str) -> str:
     txt = texto.lower()
     for sub, palavras in _SUBCATEGORIA_FINANCEIRO.items():
-        if any(p in txt for p in palavras):
+        if _contem_termo(txt, palavras):
             return sub
     return "boleto_fatura"
+
+def _como_bool(valor) -> bool:
+    """A IA às vezes manda "false"/"sim" como texto — bool("false") seria True."""
+    if isinstance(valor, str):
+        return valor.strip().lower() in ("true", "sim", "yes", "1", "s")
+    return bool(valor)
+
 
 _CATEGORIAS_GERAIS = {"agendamento", "financeiro", "comunicado", "servicos", "veiculo"}
 
@@ -2296,7 +2335,7 @@ def rodar_emails_gerais(service, labels: dict, sb: Client | None, query: str, dr
             "valor":          analise.get("valor"),
             "valor_formatado": formatar_reais(valor_num) if valor_num is not None else None,
             "link_principal": analise.get("link_principal") or _extrair_link_candidatura(corpo),
-            "requer_acao":    bool(analise.get("requer_acao", False)),
+            "requer_acao":    _como_bool(analise.get("requer_acao")),
             "status":         "novo",
         }
 

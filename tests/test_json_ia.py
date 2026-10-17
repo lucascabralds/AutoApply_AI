@@ -79,3 +79,16 @@ def test_status_das_funcoes_de_ia(monkeypatch):
     monkeypatch.setattr(gs, "_chamar_rota_ia", fora)
     assert gs.analisar_acesso("a", "b", "c") == {}
     assert gs.status_ultima_chamada() == "falha"
+
+
+@pytest.mark.parametrize("resposta, esperado", [
+    ('{"vagas": []}', []),
+    ('{"results": []}', []),
+    ('{"cargo": "Dev Python"}', ["Dev Python"]),
+    ('{"observacao": "não é vaga"}', []),
+])
+def test_formatos_de_resposta_de_vagas(monkeypatch, resposta, esperado):
+    import gemini_service as gs
+    monkeypatch.setattr(gs, "_chamar_rota_ia", lambda *a, **k: resposta)
+    assert [v["cargo"] for v in gs.extrair_vagas("Assunto", "r", "c")] == esperado
+    assert gs.status_ultima_chamada() == "ok"

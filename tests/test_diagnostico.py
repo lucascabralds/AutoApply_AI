@@ -85,3 +85,28 @@ def test_sem_rede_nao_faz_chamadas(monkeypatch):
     monkeypatch.setattr(d.requests, "post", lambda *a, **k: pytest.fail("chamou a rede"))
     monkeypatch.setattr(d.requests, "get", lambda *a, **k: pytest.fail("chamou a rede"))
     assert d.executar(com_rede=False)
+
+
+def test_erro_do_telegram_nao_vaza_o_token(monkeypatch):
+    import notificador
+    token = "123456:SEGREDO-do-bot"
+    monkeypatch.setattr(notificador, "TELEGRAM_BOT_TOKEN", token)
+    monkeypatch.setattr(notificador, "TELEGRAM_CHAT_ID", "1")
+
+    def falha(url, **k):
+        raise requests.ConnectionError(f"Max retries exceeded with url: {url}")
+    monkeypatch.setattr(d.requests, "get", falha)
+    r = d.checar_telegram()
+    assert r.nivel == d.ERRO and token not in r.detalhe and "***" in r.detalhe
+
+
+def test_resposta_200_em_formato_estranho_nao_derruba_o_diagnostico(monkeypatch):
+    monkeypatch.setattr(rota_ia_client, "ROTA_IA_API_KEY", "x")
+
+    class _R:
+        status_code, ok, text = 200, True, "[]"
+
+        def json(self):
+            return {"choices": None}
+    monkeypatch.setattr(d.requests, "post", lambda *a, **k: _R())
+    assert d.checar_rota_ia().nivel == d.ERRO

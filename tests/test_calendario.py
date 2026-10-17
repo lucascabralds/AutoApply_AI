@@ -23,6 +23,11 @@ HOJE = dt.date(2026, 10, 16)
     ("05/11 - duração 2h", dt.date(2026, 11, 5), None),           # 2h não é horário
     ("28/10, das 14h às 16h", dt.date(2026, 10, 28), dt.time(14, 0)),
     ("Consulta 28/10/2026 - 08:15", dt.date(2026, 10, 28), dt.time(8, 15)),
+    ("28/10/2026 - duração 1:30", dt.date(2026, 10, 28), None),
+    ("28/10/2026 as 2h de duração", dt.date(2026, 10, 28), None),
+    ("Consulta às 14h do dia 28/10/2026", dt.date(2026, 10, 28), dt.time(14, 0)),
+    ("14:30 28/10/2026", dt.date(2026, 10, 28), dt.time(14, 30)),
+    ("28/10/2026, horário: 16:45", dt.date(2026, 10, 28), dt.time(16, 45)),
     (None, None, None),
 ])
 def test_parsear_data_hora(texto, data, hora):

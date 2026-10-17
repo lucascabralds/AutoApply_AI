@@ -102,7 +102,7 @@ def checar_rota_ia() -> Resultado:
         return Resultado("Rota.IA", ERRO, f"HTTP {resp.status_code}: {resp.text[:120]}")
     try:
         resp.json()["choices"][0]["message"]["content"]
-    except (ValueError, KeyError, IndexError):
+    except (ValueError, KeyError, IndexError, TypeError):
         return Resultado("Rota.IA", ERRO, f"resposta fora do formato OpenAI: {resp.text[:120]}")
     return Resultado("Rota.IA", OK, f"{r.ROTA_IA_URL} respondeu (modelo {r.ROTA_IA_MODEL})")
 
@@ -144,12 +144,14 @@ def checar_telegram() -> Resultado:
 
     if not notificador.telegram_configurado():
         return Resultado("Telegram", AVISO, "desligado (TELEGRAM_BOT_TOKEN/CHAT_ID vazios)")
+    token = notificador.TELEGRAM_BOT_TOKEN
     try:
-        resp = requests.get(f"https://api.telegram.org/bot{notificador.TELEGRAM_BOT_TOKEN}/getMe", timeout=10)
+        resp = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=10)
         dados = resp.json()
     except (requests.RequestException, ValueError) as e:
-        return Resultado("Telegram", ERRO, f"API do Telegram inacessível: {e}")
-    if not dados.get("ok"):
+        # A mensagem de erro do requests traz a URL — e a URL traz o token do bot
+        return Resultado("Telegram", ERRO, f"API do Telegram inacessível: {str(e).replace(token, '***')}")
+    if not isinstance(dados, dict) or not dados.get("ok"):
         return Resultado("Telegram", ERRO, "token do bot inválido")
     return Resultado("Telegram", OK, f"bot @{dados['result'].get('username')} — teste com `python notificador.py oi`")
 

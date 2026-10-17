@@ -7,6 +7,7 @@ import rota_ia_client as r
 @pytest.fixture(autouse=True)
 def _reset(monkeypatch, tmp_path):
     monkeypatch.setattr(r, "_PAUSA_PATH", str(tmp_path / "pausa.json"))
+    monkeypatch.setattr(r, "_cache_estado", ((), {}))
     monkeypatch.setattr(r, "ROTA_IA_API_KEY", "teste")
     monkeypatch.setattr(r.time, "sleep", lambda s: None)
 
@@ -67,13 +68,30 @@ def test_erro_http_nao_abre_o_circuito(monkeypatch):
     assert r.gateway_disponivel()
 
 
-def test_timeout_de_leitura_nao_pausa_o_gateway(monkeypatch):
+def test_um_timeout_nao_pausa_mas_timeouts_seguidos_sim(monkeypatch):
     def lento(*a, **k):
         raise requests.ReadTimeout("provedor demorou")
     monkeypatch.setattr(r.requests, "post", lento)
     with pytest.raises(requests.ReadTimeout):
         r.chamar_ia("oi", max_tentativas=2)
-    assert r.gateway_disponivel()
+    assert r.gateway_disponivel()          # um digest lento não cala os alertas
+    with pytest.raises(requests.ReadTimeout):
+        r.chamar_ia("oi", max_tentativas=2)
+    assert not r.gateway_disponivel()      # travado de verdade → pausa
+
+
+def test_sucesso_zera_contagem_de_timeouts(monkeypatch):
+    r._gravar_estado({"pausado_ate": 0, "timeouts": 1})
+    monkeypatch.setattr(r.requests, "post", lambda *a, **k: _Resp())
+    r.chamar_ia("oi")
+    assert r._ler_estado() == {}
+
+
+def test_estado_reescrito_no_mesmo_instante_nao_fica_velho():
+    r._gravar_estado({"pausado_ate": 1.0, "timeouts": 0})
+    assert r._pausado_ate() == 1.0
+    r._gravar_estado({"pausado_ate": 99.0, "timeouts": 0})   # mesmo tamanho, mesmo segundo
+    assert r._pausado_ate() == 99.0
 
 
 def test_200_sem_choices_e_falha_e_nao_fecha_a_pausa(monkeypatch):

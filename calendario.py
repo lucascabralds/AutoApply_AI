@@ -62,48 +62,50 @@ def parsear_data_hora(texto: str | None, hoje: datetime.date | None = None
     hoje = hoje or datetime.date.today()
     t = str(texto).lower()
 
-    data, fim = None, 0
+    data, ini, fim = None, 0, 0
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})", t)
     if m:
         a, mo, d = (int(x) for x in m.groups())
-        data, fim = _data_segura(a, mo, d), m.end()
+        data, ini, fim = _data_segura(a, mo, d), m.start(), m.end()
     if not data:
         m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", t)
         if m:
             d, mo = int(m.group(1)), int(m.group(2))
             a = int(m.group(3)) if m.group(3) else _ano_provavel(d, mo, hoje)
-            data, fim = _data_segura(a + 2000 if a < 100 else a, mo, d), m.end()
+            data, ini, fim = _data_segura(a + 2000 if a < 100 else a, mo, d), m.start(), m.end()
     if not data:
         m = re.search(r"\b(\d{1,2})\s+de\s+([a-zç]+)(?:\s+de\s+(\d{4}))?", t)
         if m and m.group(2) in _MESES:
             d, mo = int(m.group(1)), _MESES[m.group(2)]
             a = int(m.group(3)) if m.group(3) else _ano_provavel(d, mo, hoje)
-            data, fim = _data_segura(a, mo, d), m.end()
+            data, ini, fim = _data_segura(a, mo, d), m.start(), m.end()
     if not data:
         return None, None
-    return data, _hora_depois_da_data(t[fim:])
+    return data, _extrair_hora(t, ini, fim)
 
 
-def _hora_depois_da_data(resto: str) -> datetime.time | None:
+def _extrair_hora(texto: str, ini: int, fim: int) -> datetime.time | None:
     """
-    Hora só é aceita em formatos inequívocos depois da data: "14:30",
-    "T14:30", "às 9h30", "das 14h" ou "14h" logo em seguida à data. Assim
-    "duração 2h" não vira 02:00. Meia-noite (00:00) é tratada como "sem
-    horário" — é como a IA escreve uma data pura em ISO.
+    Hora só em formatos inequívocos, para durações não virarem horário:
+      1. colada logo depois da data: "T14:30", "28/10 14h", "28/10 - 08:15"
+      2. com marcador em qualquer posição: "às 14h", "das 9h30", "horário: 14:00"
+         (exceto "as 2h de duração")
+      3. "HH:MM" logo antes da data: "14:30 28/10"
+    "duração 1:30" e "duração 2h" não casam com nenhum. Meia-noite (00:00) é
+    tratada como "sem horário" — é como a IA escreve uma data pura em ISO.
     """
-    padroes = [
-        r"^t?\s*(\d{1,2}):(\d{2})",                        # T14:30 / " 14:30"
-        r"^[\s,–-]*(\d{1,2})h(\d{2})?\b",                    # "28/10 14h"
-        r"\b(?:às|as|das|a partir das)\s+(\d{1,2})(?:h(\d{2})?\b|:(\d{2}))",
-        r"\b(\d{1,2}):(\d{2})\b",
+    hm = r"(\d{1,2})(?::(\d{2})|h(\d{2})?\b)"
+    tentativas = [
+        re.match(r"(?:t|[\s,–-]+)" + hm, texto[fim:]),
+        re.search(r"\b(?:às|as|das|a partir das|horário|horario|hora)\s*:?\s*" + hm
+                  + r"(?!\s*(?:de\s+)?dura)", texto),
+        re.search(r"(\d{1,2}):(\d{2})()[\s,–-]*$", texto[:ini]),
     ]
-    for padrao in padroes:
-        m = re.search(padrao, resto)
+    for m in tentativas:
         if not m:
             continue
-        grupos = [g for g in m.groups() if g is not None]
-        h = int(grupos[0])
-        mi = int(grupos[1]) if len(grupos) > 1 else 0
+        h = int(m.group(1))
+        mi = int(m.group(2) or m.group(3) or 0)
         if 0 <= h <= 23 and 0 <= mi <= 59 and (h, mi) != (0, 0):
             return datetime.time(h, mi)
         return None

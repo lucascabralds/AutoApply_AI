@@ -407,8 +407,14 @@ Corpo do e-mail:
         if isinstance(data, list):
             vagas = data
         elif isinstance(data, dict):
-            # Às vezes o modelo envolve em {"vagas": [...]}
-            vagas = data.get("vagas") or data.get("results") or [data]
+            # Às vezes o modelo envolve em {"vagas": [...]} — e {"vagas": []}
+            # é uma resposta válida de "nenhuma vaga", não uma vaga vazia.
+            if "vagas" in data or "results" in data:
+                vagas = data.get("vagas", data.get("results")) or []
+            elif data.get("cargo"):
+                vagas = [data]   # uma vaga só, sem lista em volta
+            else:
+                vagas = []
         else:
             vagas = []
 

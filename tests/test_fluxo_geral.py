@@ -123,3 +123,15 @@ def test_vistoria_do_detran_vira_agendamento(ambiente, monkeypatch):
                              "newer_than:1d", dry_run=False, calendar_service=cal)
     assert gmail.labels_aplicadas["a1"] == ["G", "G_AG"]
     assert cal.eventos[0]["summary"] == "📅 Detran-SP" and "dateTime" in cal.eventos[0]["start"]
+
+
+def test_falha_permanente_da_ia_cai_na_heuristica_depois_de_n_tentativas(ambiente, monkeypatch):
+    gmail, _ = ambiente
+    gmail.mensagens = {"f1": _msg("Sua fatura chegou", "Vivo <fatura@vivo.com.br>", "Fatura de outubro")}
+    monkeypatch.setattr(main, "_status_ia", lambda: "falha")   # ex.: chave errada → 401 sempre
+    labels = {"geral_pai": "G", "geral_financeiro": "G_FIN"}
+    for _ in range(main.MAX_TENTATIVAS_IA - 1):
+        main.rodar_emails_gerais(gmail, labels, _FakeSB(), "q", dry_run=False)
+        assert "f1" not in gmail.labels_aplicadas      # ainda tentando
+    main.rodar_emails_gerais(gmail, labels, _FakeSB(), "q", dry_run=False)
+    assert gmail.labels_aplicadas["f1"] == ["G", "G_FIN"]   # desistiu da IA, salvou pela heurística
