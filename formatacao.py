@@ -17,6 +17,15 @@ def formatar_reais(valor) -> str:
     return "R$ " + f"{n:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+_EMPRESA_ANONIMA = ("não identificada", "nao identificada", "empresa confidencial", "confidencial",
+                    "sigilosa", "empresa sigilosa")
+
+
 def empresa_conhecida(empresa: str | None) -> bool:
-    """False para vazio e para o placeholder "Não identificada" que o pipeline grava."""
-    return bool(empresa) and not empresa.strip().lower().startswith("não identificada")
+    """
+    False para vazio, para o placeholder "Não identificada" que o pipeline grava
+    e para anúncios anônimos ("Empresa Confidencial" na Catho). Isso importa na
+    deduplicação: duas vagas "Assistente de Compras @ Empresa Confidencial" são,
+    quase sempre, de empresas diferentes — o link da vaga é que as distingue.
+    """
+    return bool(empresa) and not empresa.strip().lower().startswith(_EMPRESA_ANONIMA)

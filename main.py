@@ -711,6 +711,8 @@ def _resolver_link_real(href: str) -> str:
             qs = urllib.parse.parse_qs(parsed.query)
             payload = qs.get("i", [None])[0]
             if payload:
+                # parse_qs troca "+" (válido no base64 padrão da Catho) por espaço
+                payload = payload.replace(" ", "+")
                 pad = "=" * (-len(payload) % 4)
                 decodificado = base64.urlsafe_b64decode(payload + pad)
                 dados = json.loads(decodificado)
