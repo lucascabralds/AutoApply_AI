@@ -20,6 +20,8 @@ from dataclasses import dataclass
 import requests
 from dotenv import load_dotenv
 
+import console
+
 load_dotenv()
 
 OK, AVISO, ERRO = "OK", "AVISO", "ERRO"
@@ -120,7 +122,7 @@ def checar_supabase() -> list[Resultado]:
 
     res = []
     tabelas = {
-        "vagas_extraidas": "id, vaga_uid, empresa, score_match",
+        "vagas_extraidas": "id, vaga_uid, empresa, score_match, motivos_match",
         "certificados_portfolio": "id",
         "log_acessos_otp": "id",
         "despesas_domesticas": "id",
@@ -133,7 +135,7 @@ def checar_supabase() -> list[Resultado]:
             msg = str(e)
             if tabela == "vagas_extraidas" and ("vaga_uid" in msg or "PGRST204" in msg or "42703" in msg):
                 res.append(Resultado(f"Supabase: {tabela}", AVISO,
-                                     "sem as colunas da v3 — rode supabase/schema.sql no SQL Editor"))
+                                     "sem as colunas novas (vaga_uid / motivos_match) — rode supabase/schema.sql no SQL Editor"))
             else:
                 res.append(Resultado(f"Supabase: {tabela}", ERRO, f"{msg[:140]} — rode supabase/schema.sql"))
     return res
@@ -194,6 +196,7 @@ def main() -> None:
     parser.add_argument("--sem-rede", action="store_true", help="Só verificações locais")
     parser.add_argument("--json", action="store_true", help="Saída em JSON")
     args = parser.parse_args()
+    console.preparar_console()
 
     resultados = executar(com_rede=not args.sem_rede)
     if args.json:

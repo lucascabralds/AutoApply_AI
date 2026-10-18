@@ -25,6 +25,7 @@ import webbrowser
 
 from dotenv import load_dotenv
 
+import console
 from briefing_diario import coletar_vagas
 from formatacao import empresa_conhecida, formatar_reais
 
@@ -143,7 +144,7 @@ def montar_dados(brutos: dict, dias: int, agora: datetime.datetime | None = None
             "vagas":          len(vagas),
             "vagas_alta":     sum(1 for s in com_score if s >= 75),
             "score_medio":    round(sum(com_score) / len(com_score)) if com_score else None,
-            "candidaturas":   sum(1 for v in vagas if v["status"] != "nova"),
+            "candidaturas":   sum(1 for v in vagas if v["status"] not in ("nova", "descartada")),
             "em_processo":    sum(1 for v in vagas if v["status"] == "em_processo"),
             "despesas":       len(brutos.get("despesas", [])),
             "despesas_total": formatar_reais(sum(valores)) if valores else "—",
@@ -187,6 +188,7 @@ def main() -> None:
     parser.add_argument("--saida", default=SAIDA_PADRAO, help="Arquivo HTML gerado")
     parser.add_argument("--abrir", action="store_true", help="Abre o dashboard no navegador ao final")
     args = parser.parse_args()
+    console.preparar_console()
 
     url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
     chave = os.getenv("SUPABASE_KEY")

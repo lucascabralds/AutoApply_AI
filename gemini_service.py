@@ -64,14 +64,14 @@ def _definir_status(novo: str) -> None:
     _status = novo
 
 
-def _chamar_gemini(prompt: str, max_tentativas: int = 3) -> str:
+def _chamar_gemini(prompt: str, max_tentativas: int = 3, max_tokens: int | None = None) -> str:
     """
     Envia o prompt para o gateway Rota.IA com retry automático em 429/503.
     Mantém o nome original da função por compatibilidade com o resto do módulo.
     Raises a última exceção se todas as tentativas falharem.
     """
     _definir_status("falha")   # vira "ok" só se a resposta chegar
-    resposta = _chamar_rota_ia(prompt, max_tentativas=max_tentativas)
+    resposta = _chamar_rota_ia(prompt, max_tentativas=max_tentativas, max_tokens=max_tokens)
     _definir_status("ok")
     return resposta
 
@@ -174,29 +174,32 @@ def _parse_json(raw: str) -> dict | list:
     # Isola do primeiro '{'/'[' ao último '}'/']' — descarta qualquer
     # texto explicativo que a IA tenha colocado antes/depois do JSON.
     inicio = next((i for i, c in enumerate(texto) if c in "{["), None)
+    cauda = texto[inicio:] if inicio is not None else texto
     if inicio is not None:
         fecha = "}" if texto[inicio] == "{" else "]"
         fim = texto.rfind(fecha)
         if fim != -1 and fim > inicio:
             texto = texto[inicio:fim + 1]
 
-    try:
-        return json.loads(texto)
-    except json.JSONDecodeError:
-        pass
+    def _sem_virgula_solta(t: str) -> str:
+        # Remove vírgulas soltas antes de } ou ] (erro comum do modelo)
+        return re.sub(r",\s*([}\]])", r"\1", t)
 
-    # Remove vírgulas soltas antes de } ou ] (erro comum do modelo)
-    texto_sem_virgula_solta = re.sub(r",\s*([}\]])", r"\1", texto)
-    try:
-        return json.loads(texto_sem_virgula_solta)
-    except json.JSONDecodeError:
-        pass
+    for candidato in (texto, _sem_virgula_solta(texto)):
+        try:
+            return json.loads(candidato)
+        except json.JSONDecodeError:
+            pass
 
-    # Última tentativa: resposta truncada — recupera o que der
-    reparado = _tentar_reparar_json_truncado(texto_sem_virgula_solta)
-    if reparado is not None:
-        logger.warning("JSON da IA veio truncado — dados parciais recuperados")
-        return reparado
+    # Última tentativa: resposta truncada — recupera o que der. O reparo usa
+    # a cauda INTEIRA desde o primeiro '['/'{': numa resposta cortada, o
+    # "último ]" do recorte acima é o fim de uma lista interna (ex.:
+    # tecnologias da 1ª vaga) e reparar só até ali perdia o resto da vaga.
+    for candidato in (_sem_virgula_solta(cauda), _sem_virgula_solta(texto)):
+        reparado = _tentar_reparar_json_truncado(candidato)
+        if reparado is not None:
+            logger.warning("JSON da IA veio truncado — dados parciais recuperados")
+            return reparado
 
     logger.warning(f"Gemini JSON inválido (irrecuperável): {raw[:100]}")
     _definir_status("falha")
@@ -330,76 +333,133 @@ Prévia: {corpo_preview[:400]}
 # 2. EXTRAIR VAGAS  (suporta múltiplas vagas por e-mail)
 # ---------------------------------------------------------------------------
 
-def extrair_vagas(assunto: str, remetente: str, corpo: str,
-                  links_html: list[dict] | None = None) -> list[dict]:
+# Máximo de vagas pedidas por e-mail: digests como "Melhores vagas da semana"
+# trazem centenas; pedir todas estourava o limite de resposta e o JSON vinha
+# cortado. As primeiras do e-mail são as que a plataforma destacou.
+MAX_VAGAS_POR_EMAIL = 10
+MAX_TOKENS_VAGAS    = 4096
+
+# Termos do perfil do Lucas (Python / dados / automação) para o score de
+# reserva quando a IA não chega a informar o score (resposta cortada).
+_TERMOS_PERFIL = {
+    "python": 30, "dados": 20, "data": 20, "sql": 15, "power bi": 15, "powerbi": 15,
+    "automação": 15, "automacao": 15, "rpa": 10, "etl": 10, "api": 10, "fastapi": 10,
+    "django": 10, "flask": 10, "bi": 10, "analista": 5, "desenvolvedor": 5,
+    "developer": 5, "backend": 10, "excel": 5, "vba": 5, "ia": 10, "machine learning": 10,
+}
+
+
+def _score_reserva(cargo: str, tecnologias: list) -> int:
     """
-    Extrai todas as vagas contidas em um único e-mail.
-
-    Suporta:
-    - E-mails com 1 vaga (resposta da empresa, Gupy, pandape)
-    - E-mails com N vagas (digest da Catho, Indeed, LinkedIn, Infojobs)
-
-    links_html: lista de dicts {"url", "texto", "score"} extraída do HTML bruto.
-      Quando fornecida, o prompt instrui o Gemini a associar cada vaga ao seu link.
-
-    Retorna lista de dicts com a estrutura abaixo. Retorna [] em caso de falha.
+    Score aproximado (0-100) a partir do cargo e das tecnologias, usado só
+    quando a IA não devolveu score_match — antes essas vagas saíam com 0%
+    e sumiam do topo do briefing mesmo sendo de Python/dados.
     """
-    _definir_status("heuristica")
-    # Prepara bloco de links para injetar no prompt
+    texto = " ".join([cargo or ""] + [str(t) for t in tecnologias or []]).lower()
+    pontos = sum(peso for termo, peso in _TERMOS_PERFIL.items()
+                 if re.search(r"(?<!\w)" + re.escape(termo) + r"(?!\w)", texto))
+    return max(20, min(90, pontos))
+
+
+def _prompt_vagas(assunto: str, remetente: str, corpo: str, links: list[dict]) -> str:
     bloco_links = ""
-    if links_html:
-        linhas = []
-        for item in links_html[:20]:   # máx 20 links para não inflar o prompt
-            linhas.append(f'  "{item["texto"][:60]}" → {item["url"][:100]}')
+    if links:
+        linhas = [f'  [{i}] {item["texto"][:70]}' for i, item in enumerate(links)]
         bloco_links = (
-            "\n\nLINKS IDENTIFICADOS NO E-MAIL (texto → URL):\n"
-            + "\n".join(linhas)
-            + "\n\nIMPORTANTE: use esses links para preencher link_candidatura de cada vaga."
-            + " Associe cada vaga ao link cujo texto corresponde ao cargo."
-            + " Ignore links de 'cancelar', 'unsubscribe', 'descadastrar'."
+            "\nLINKS DO E-MAIL (índice e texto do link):\n" + "\n".join(linhas) + "\n"
+            "Em \"link\", coloque o ÍNDICE do link cujo texto corresponde à vaga "
+            "(ou null). Nunca escreva a URL.\n"
         )
+    return f"""Extraia as vagas de emprego deste e-mail.
 
-    prompt = f"""
-Você é um assistente de RH especializado em tecnologia.
-
-O e-mail abaixo pode conter UMA ou VÁRIAS vagas de emprego.
-Extraia TODAS as vagas presentes e retorne uma lista JSON.
+Candidato: júnior em Python, dados, SQL/Power BI, automação e APIs.
 
 REGRAS:
-- Digest (Catho, Indeed, LinkedIn com múltiplas vagas) → extraia cada vaga individualmente.
-- "sua candidatura foi enviada" → tipo_email = "candidatura_enviada".
-- "você avançou de fase" → tipo_email = "avanco_fase".
-- "retorno do processo seletivo" → tipo_email = "retorno".
-- score_match: 0-100 baseado em Python, automação, dados, IA, APIs. Vagas sem tech → score 30.
-- link_candidatura: use os links fornecidos abaixo, associando pelo texto do cargo.
-  NÃO use links de cancelar inscrição, unsubscribe ou descadastrar.{bloco_links}
-
-Responda APENAS com uma lista JSON (sem crases, sem texto fora da lista):
-[
-  {{
-    "cargo": "string",
-    "empresa": "string ou null",
-    "local": "cidade/estado ou null",
-    "modelo_trabalho": "Remoto | Híbrido | Presencial | Não informado",
-    "salario": "string com valor (ex: R$ 4.380,00) ou null",
-    "requisitos": ["lista de requisitos ou []"],
-    "tecnologias": ["lista de techs identificadas ou []"],
-    "score_match": 0,
-    "link_candidatura": "URL exata da lista de links acima, ou null",
-    "tipo_email": "candidatura_enviada | nova_vaga | retorno | avanco_fase | outro",
-    "status_candidatura": "enviada | avanco | reprovado | nova | null"
-  }}
-]
+- Digest com várias vagas → um item por vaga, no máximo {MAX_VAGAS_POR_EMAIL} (as primeiras do e-mail).
+- Sem nenhuma vaga de emprego real (curso, promoção, newsletter) → [].
+- tipo: "nova_vaga" | "candidatura_enviada" | "avanco_fase" | "retorno" | "outro".
+- score: 0-100 de aderência ao candidato (Python/dados/automação = alto; sem relação = baixo).
+- requisitos: no máximo 4 itens curtos; tecnologias: no máximo 6.
+- Textos curtos. Responda SÓ o JSON, sem explicações nem raciocínio.
+{bloco_links}
+Formato (lista JSON):
+[{{"cargo": "...", "empresa": null, "local": null, "modelo": "Remoto|Híbrido|Presencial|Não informado", "salario": null, "requisitos": [], "tecnologias": [], "score": 0, "link": null, "tipo": "nova_vaga", "status": null}}]
 
 Remetente: {remetente}
 Assunto: {assunto}
-Corpo do e-mail:
+Corpo:
 {corpo[:3500]}
 {INSTRUCAO_JSON_PURO}
 """
+
+
+def _normalizar_vaga(item: dict, assunto: str, links: list[dict]) -> dict | None:
+    """Converte o formato enxuto da resposta para o formato usado pelo pipeline."""
+    cargo = item.get("cargo")
+    if not cargo:
+        return None
+
+    link = item.get("link", item.get("link_candidatura"))
+    if isinstance(link, bool):
+        link = None
+    if isinstance(link, (int, float)) or (isinstance(link, str) and link.strip().isdigit()):
+        i = int(link)
+        link = links[i]["url"] if 0 <= i < len(links) else None
+    elif not (isinstance(link, str) and link.startswith(("http://", "https://"))):
+        link = None
+
+    tecnologias = item.get("tecnologias") if isinstance(item.get("tecnologias"), list) else []
+    requisitos = item.get("requisitos") if isinstance(item.get("requisitos"), list) else []
+    score = item.get("score", item.get("score_match"))
     try:
-        raw = _chamar_gemini(prompt)
+        score = max(0, min(100, int(score)))
+    except (TypeError, ValueError):
+        score = _score_reserva(cargo, tecnologias)
+
+    return {
+        "cargo":              str(cargo)[:120],
+        "empresa":            item.get("empresa"),
+        "local":              item.get("local"),
+        "modelo_trabalho":    item.get("modelo") or item.get("modelo_trabalho") or "Não informado",
+        "salario":            item.get("salario"),
+        "requisitos":         requisitos,
+        "tecnologias":        tecnologias,
+        "score_match":        score,
+        "link_candidatura":   link,
+        "tipo_email":         item.get("tipo") or item.get("tipo_email") or "nova_vaga",
+        "status_candidatura": item.get("status") or item.get("status_candidatura") or "nova",
+    }
+
+
+def extrair_vagas(assunto: str, remetente: str, corpo: str,
+                  links_html: list[dict] | None = None) -> list[dict]:
+    """
+    Extrai as vagas contidas em um único e-mail (1 vaga ou digest com N).
+
+    links_html: lista de dicts {"texto", "url"} extraída do HTML bruto. A IA
+      responde o ÍNDICE do link de cada vaga e a URL é preenchida aqui — sem
+      repetir URLs longas na resposta (que estourava o limite) e sem a IA
+      poder inventar link.
+
+    Retorna lista de dicts no formato do pipeline (cargo, empresa, local,
+    modelo_trabalho, salario, requisitos, tecnologias, score_match,
+    link_candidatura, tipo_email, status_candidatura). [] em caso de falha.
+    """
+    _definir_status("heuristica")
+    links = (links_html or [])[:25]
+    prompt = _prompt_vagas(assunto, remetente, corpo, links)
+    try:
+        raw = _chamar_gemini(prompt, max_tokens=MAX_TOKENS_VAGAS)
         data = _parse_json(raw)
+        if _status == "falha" and raw and raw.strip():
+            # Alguns modelos respondem com raciocínio em texto em vez de JSON —
+            # uma segunda chance, curta e direta, costuma resolver.
+            raw = _chamar_gemini(
+                prompt + "\n\nATENÇÃO: sua resposta anterior não era JSON. "
+                         "Responda agora APENAS a lista JSON, começando com [",
+                max_tentativas=1, max_tokens=MAX_TOKENS_VAGAS,
+            )
+            data = _parse_json(raw)
         if _status == "falha":
             return []   # sem isto, o {} irrecuperável virava [{}] → uma vaga fictícia
 
@@ -418,33 +478,12 @@ Corpo do e-mail:
         else:
             vagas = []
 
-        # Garante que cada item é dict e tem os campos mínimos
         resultado = []
-        for item in vagas:
-            if not isinstance(item, dict):
-                continue
-            # Normaliza campos obrigatórios
-            item.setdefault("cargo",              assunto[:80])
-            item.setdefault("empresa",            None)
-            item.setdefault("local",              None)
-            item.setdefault("modelo_trabalho",    "Não informado")
-            item.setdefault("salario",            None)
-            item.setdefault("requisitos",         [])
-            item.setdefault("tecnologias",        [])
-            item.setdefault("score_match",        0)
-            item.setdefault("link_candidatura",   None)
-            item.setdefault("tipo_email",         "nova_vaga")
-            item.setdefault("status_candidatura", "nova")
-
-            # Garante tipos
-            if not isinstance(item["requisitos"],  list): item["requisitos"]  = []
-            if not isinstance(item["tecnologias"], list): item["tecnologias"] = []
-            if not isinstance(item["score_match"], int):
-                try:    item["score_match"] = int(item["score_match"])
-                except: item["score_match"] = 0
-
-            resultado.append(item)
-
+        for item in vagas[:MAX_VAGAS_POR_EMAIL]:
+            if isinstance(item, dict):
+                vaga = _normalizar_vaga(item, assunto, links)
+                if vaga:
+                    resultado.append(vaga)
         return resultado
 
     except Exception as e:

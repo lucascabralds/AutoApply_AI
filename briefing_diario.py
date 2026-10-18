@@ -5,6 +5,8 @@ Gera e envia o briefing matinal do dia: resume tudo que o pipeline processou
 nas últimas 24h e envia como e-mail para o próprio Gmail do usuário.
 
 Conteúdo do briefing:
+  🎯 Aplicar hoje — as melhores vagas ainda não aplicadas (últimos 7 dias), com o porquê
+  📊 Funil        — nova → aplicada → em processo → resultado (30 dias) e candidaturas sem retorno
   📋 Vagas        — quantas chegaram, quais têm score alto, links diretos
   📅 Agendamentos — confirmações de horário do dia
   💰 Financeiro   — boletos, faturas, valores e datas de vencimento
@@ -36,6 +38,7 @@ load_dotenv()
 from googleapiclient.errors import HttpError
 import base64
 
+import console
 import google_auth
 from formatacao import empresa_conhecida, formatar_reais
 from seguranca import redigir_segredo
@@ -53,6 +56,14 @@ SUPABASE_KEY   = os.getenv("SUPABASE_KEY")
 
 # Destinatário do briefing — padrão: próprio Gmail
 DESTINATARIO = os.getenv("BRIEFING_DESTINATARIO", "me")
+
+# "Aplicar hoje": vagas ainda não aplicadas, com score mínimo, dos últimos N dias
+SCORE_APLICAR_HOJE = int(os.getenv("SCORE_APLICAR_HOJE", "60"))
+DIAS_APLICAR_HOJE  = int(os.getenv("DIAS_APLICAR_HOJE", "7"))
+LIMITE_APLICAR_HOJE = int(os.getenv("LIMITE_APLICAR_HOJE", "5"))
+# Candidatura "aplicada" há mais de N dias sem avançar → sugerir follow-up
+DIAS_SEM_RETORNO   = int(os.getenv("DIAS_SEM_RETORNO", "10"))
+DIAS_FUNIL         = 30
 
 # Ícones das seções
 ICONES = {
@@ -98,8 +109,9 @@ def _janela_iso(dias: int) -> str:
     return dt.isoformat()
 
 
-_COLUNAS_VAGAS_LEGADO = "cargo, fonte, tecnologias, links_candidatura, status_aplicacao, created_at"
-_COLUNAS_VAGAS_V3     = _COLUNAS_VAGAS_LEGADO + ", empresa, local, score_match, modelo_trabalho"
+_COLUNAS_VAGAS_LEGADO = "id, cargo, fonte, tecnologias, links_candidatura, status_aplicacao, created_at"
+_COLUNAS_VAGAS_V3     = _COLUNAS_VAGAS_LEGADO + ", empresa, local, score_match, modelo_trabalho, tipo_email"
+_COLUNAS_VAGAS_V4     = _COLUNAS_VAGAS_V3 + ", motivos_match"
 
 
 def coletar_vagas(sb: Client, dias: int, limite: int = 100) -> list[dict]:
@@ -110,7 +122,7 @@ def coletar_vagas(sb: Client, dias: int, limite: int = 100) -> list[dict]:
     """
     if not sb:
         return []
-    for colunas in (_COLUNAS_VAGAS_V3, _COLUNAS_VAGAS_LEGADO):
+    for colunas in (_COLUNAS_VAGAS_V4, _COLUNAS_VAGAS_V3, _COLUNAS_VAGAS_LEGADO):
         try:
             res = (
                 sb.table("vagas_extraidas")
@@ -182,6 +194,158 @@ def coletar_certificados(sb: Client, dias: int) -> list[dict]:
     except Exception as e:
         print(f"[WARN] coletar_certificados: {e}")
         return []
+
+
+# ===========================================================================
+# PRIORIZAÇÃO: o que fazer hoje com as vagas
+# ===========================================================================
+
+_ORDEM_FUNIL = ["nova", "aplicada", "em_processo", "aprovada", "reprovada", "descartada"]
+
+
+def _lista(valor) -> list:
+    """Colunas jsonb antigas guardavam listas como string JSON."""
+    if isinstance(valor, list):
+        return valor
+    if isinstance(valor, str):
+        try:
+            convertido = json.loads(valor)
+            return convertido if isinstance(convertido, list) else []
+        except json.JSONDecodeError:
+            return []
+    return []
+
+
+def _dias_desde(iso: str | None, agora: datetime.datetime) -> float | None:
+    if not iso:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return (agora - dt).total_seconds() / 86400
+
+
+def _chave_vaga(v: dict) -> tuple:
+    return ((v.get("cargo") or "").strip().lower(), (v.get("empresa") or "").strip().lower())
+
+
+def selecionar_para_aplicar(vagas: list[dict], agora: datetime.datetime | None = None,
+                            score_min: int = SCORE_APLICAR_HOJE, dias: int = DIAS_APLICAR_HOJE,
+                            limite: int = LIMITE_APLICAR_HOJE) -> list[dict]:
+    """
+    As melhores vagas para se candidatar HOJE: anúncios novos (não
+    acompanhamento), ainda não aplicados, recentes (vaga boa some rápido)
+    e com score mínimo — maior score primeiro, uma por cargo+empresa.
+    """
+    agora = agora or datetime.datetime.now(datetime.timezone.utc)
+    escolhidas, vistas = [], set()
+    for v in sorted(vagas, key=lambda x: x.get("score_match") or 0, reverse=True):
+        if (v.get("status_aplicacao") or "nova") != "nova":
+            continue
+        if (v.get("tipo_email") or "nova_vaga") != "nova_vaga":
+            continue
+        if (v.get("score_match") or 0) < score_min:
+            continue
+        idade = _dias_desde(v.get("created_at"), agora)
+        if idade is not None and idade > dias:
+            continue
+        chave = _chave_vaga(v)
+        if chave in vistas:
+            continue
+        vistas.add(chave)
+        escolhidas.append(v)
+        if len(escolhidas) >= limite:
+            break
+    return escolhidas
+
+
+def resumir_funil(vagas: list[dict], agora: datetime.datetime | None = None,
+                  dias_sem_retorno: int = DIAS_SEM_RETORNO) -> dict:
+    """
+    Contagem por etapa do funil de candidaturas e as candidaturas paradas
+    ("aplicada" há mais de N dias, contando da data em que a vaga entrou).
+    """
+    agora = agora or datetime.datetime.now(datetime.timezone.utc)
+    contagem = {etapa: 0 for etapa in _ORDEM_FUNIL}
+    sem_retorno = []
+    for v in vagas:
+        status = v.get("status_aplicacao") or "nova"
+        contagem[status] = contagem.get(status, 0) + 1
+        if status == "aplicada":
+            idade = _dias_desde(v.get("created_at"), agora)
+            if idade is not None and idade >= dias_sem_retorno:
+                sem_retorno.append({**v, "dias": int(idade)})
+    candidaturas = sum(contagem[e] for e in ("aplicada", "em_processo", "aprovada", "reprovada"))
+    respostas = sum(contagem[e] for e in ("em_processo", "aprovada", "reprovada"))
+    return {
+        "contagem": contagem,
+        "candidaturas": candidaturas,
+        "taxa_resposta": round(100 * respostas / candidaturas) if candidaturas else None,
+        "sem_retorno": sorted(sem_retorno, key=lambda v: v["dias"], reverse=True)[:5],
+    }
+
+
+def _formatar_aplicar_hoje(vagas: list[dict]) -> tuple[str, str]:
+    if not vagas:
+        msg = f"Nenhuma vaga nova com score ≥ {SCORE_APLICAR_HOJE}% nos últimos {DIAS_APLICAR_HOJE} dias."
+        return f"  {msg}\n", f"<li>{escape(msg)}</li>"
+    txt, html = [], []
+    for i, v in enumerate(vagas, 1):
+        cargo = (v.get("cargo") or "Cargo não identificado")[:60]
+        if empresa_conhecida(v.get("empresa")):
+            cargo = f"{cargo} @ {v['empresa'][:30]}"
+        detalhes = " · ".join(str(x) for x in (v.get("modelo_trabalho"), v.get("local"))
+                              if x and x != "Não informado")
+        score = v.get("score_match") or 0
+        links = _lista(v.get("links_candidatura"))
+        link = links[0] if links else None
+        motivos = ", ".join(str(m) for m in _lista(v.get("motivos_match"))[:4])
+
+        vaga_id = f"#{v['id']} " if v.get("id") is not None else ""
+        txt.append(f"  {i}. {vaga_id}{cargo} — {score}%" + (f"  ({detalhes})" if detalhes else ""))
+        if motivos:
+            txt.append(f"     por quê: {motivos}")
+        txt.append(f"     {link}" if link else "     (sem link — procure a vaga na plataforma de origem)")
+
+        titulo = escape(cargo)
+        if link:
+            titulo = f'<a href="{escape(link, quote=True)}">{titulo}</a>'
+        html.append(
+            f"<li>{escape(vaga_id)}<b>{titulo}</b> — {score}%"
+            + (f" <i>({escape(detalhes)})</i>" if detalhes else "")
+            + (f'<br><span style="color:#7a82a0">por quê: {escape(motivos)}</span>' if motivos else "")
+            + "</li>"
+        )
+    dica = "Já se candidatou? python vagas.py aplicar <#>  ·  Sem interesse? python vagas.py descartar <#>"
+    txt.append(f"  {dica}")
+    html.append(f'<li style="color:#7a82a0">{escape(dica)}</li>')
+    return "\n".join(txt) + "\n", "".join(html)
+
+
+def _formatar_funil(funil: dict) -> tuple[str, str]:
+    c = funil["contagem"]
+    linha = (f"nova {c['nova']} → aplicada {c['aplicada']} → em processo {c['em_processo']} → "
+             f"aprovada {c['aprovada']}  |  reprovada {c['reprovada']}"
+             + (f"  |  descartada {c['descartada']}" if c.get("descartada") else ""))
+    taxa = funil.get("taxa_resposta")
+    linha_taxa = (f"Taxa de resposta: {taxa}% de {funil['candidaturas']} candidatura(s)"
+                  if taxa is not None else "Nenhuma candidatura registrada ainda.")
+    txt = [f"  {linha}", f"  {linha_taxa}"]
+    html = [f"<li>{escape(linha)}</li>", f"<li>{escape(linha_taxa)}</li>"]
+    if funil.get("sem_retorno"):
+        txt.append(f"  Sem retorno há {DIAS_SEM_RETORNO}+ dias — vale um follow-up:")
+        html.append(f"<li>Sem retorno há {DIAS_SEM_RETORNO}+ dias — vale um follow-up:<ul>")
+        for v in funil["sem_retorno"]:
+            nome = (v.get("cargo") or "?")[:50]
+            if empresa_conhecida(v.get("empresa")):
+                nome = f"{nome} @ {v['empresa'][:30]}"
+            txt.append(f"    · {nome} ({v['dias']} dias)")
+            html.append(f"<li>{escape(nome)} ({v['dias']} dias)</li>")
+        html.append("</ul></li>")
+    return "\n".join(txt) + "\n", "".join(html)
 
 
 # ===========================================================================
@@ -270,7 +434,7 @@ def _formatar_vagas(vagas: list[dict]) -> tuple[str, str]:
             else:
                 links = links_raw or []
             link = links[0] if links else None
-            status = v.get("status_aplicacao", "nova")
+            status = v.get("status_aplicacao") or "nova"
 
             score_txt = f" {score}%" if score else ""
 
@@ -334,6 +498,8 @@ def montar_briefing(
     agendamentos: list[dict],
     comunicados:  list[dict],
     dias:         int,
+    para_aplicar: list[dict] | None = None,
+    funil:        dict | None = None,
 ) -> tuple[str, str]:
     """
     Monta o briefing em dois formatos: texto puro e HTML.
@@ -360,15 +526,21 @@ def montar_briefing(
     txt_sumario = (
         f"  RESUMO\n"
         f"  {'─'*40}\n"
-        f"  💼 Vagas novas        : {len(vagas)}\n"
+        + (f"  🎯 Aplicar hoje       : {len(para_aplicar)}\n" if para_aplicar is not None else "")
+        + f"  💼 Vagas novas        : {len(vagas)}\n"
         f"  📅 Agendamentos       : {len(agendamentos)}\n"
         f"  💰 Financeiro         : {len(despesas)}\n"
         f"  📢 Comunicados        : {len(comunicados)}\n"
         f"  🔒 Alertas de acesso  : {len(alertas)}\n"
         f"  🎓 Certificados       : {len(certificados)}\n\n"
     )
+    linha_aplicar_html = "" if para_aplicar is None else (
+        '<tr><td style="padding:4px 8px">🎯 Aplicar hoje</td>'
+        f'<td style="color:#00e5a0;font-weight:bold;padding:4px 8px">{len(para_aplicar)}</td></tr>'
+    )
     html_sumario = f"""
 <table style="width:100%;border-collapse:collapse;margin-bottom:16px">
+  {linha_aplicar_html}
   <tr><td style="padding:4px 8px">💼 Vagas novas</td>
       <td style="color:#00e5a0;font-weight:bold;padding:4px 8px">{len(vagas)}</td></tr>
   <tr><td style="padding:4px 8px">📅 Agendamentos</td>
@@ -406,8 +578,19 @@ def montar_briefing(
     tag, hag = _formatar_comunicados(agendamentos)
     tco, hco = _formatar_comunicados(comunicados)
 
+    txt_prioridade, html_prioridade = "", ""
+    if para_aplicar is not None:
+        tp, hp = _formatar_aplicar_hoje(para_aplicar)
+        txt_prioridade += secao_txt("🎯", "APLICAR HOJE", tp)
+        html_prioridade += secao_html("🎯", "Aplicar hoje", hp, "#00e5a0")
+    if funil is not None:
+        tf, hf = _formatar_funil(funil)
+        txt_prioridade += secao_txt("📊", f"FUNIL DE CANDIDATURAS ({DIAS_FUNIL} DIAS)", tf)
+        html_prioridade += secao_html("📊", f"Funil de candidaturas ({DIAS_FUNIL} dias)", hf, "#4d9fff")
+
     txt_body = (
-        secao_txt("💼", "VAGAS",        tv)
+        txt_prioridade
+        + secao_txt("💼", "VAGAS",        tv)
         + secao_txt("📅", "AGENDAMENTOS", tag)
         + secao_txt("💰", "FINANCEIRO",   td)
         + secao_txt("📢", "COMUNICADOS",  tco)
@@ -416,7 +599,8 @@ def montar_briefing(
     )
 
     html_body = (
-        secao_html("💼", "Vagas",        hv,   "#00e5a0")
+        html_prioridade
+        + secao_html("💼", "Vagas",        hv,   "#00e5a0")
         + secao_html("📅", "Agendamentos", hag,  "#4d9fff")
         + secao_html("💰", "Financeiro",   hd,   "#f0c040")
         + secao_html("📢", "Comunicados",  hco,  "#a78bfa")
@@ -495,6 +679,7 @@ def main():
         help="Endereço de destino (padrão: BRIEFING_DESTINATARIO do .env ou o próprio Gmail)",
     )
     args = parser.parse_args()
+    console.preparar_console()
 
     print(f"\n{'='*54}")
     print(f"  AutoApply AI — Briefing Matinal")
@@ -516,6 +701,11 @@ def main():
     despesas     = coletar_despesas(sb, args.dias)
     alertas      = coletar_alertas(sb, args.dias)
     certificados = coletar_certificados(sb, args.dias)
+    # Histórico maior que a janela: vaga boa de 3 dias atrás ainda vale a
+    # candidatura, e o funil precisa das vagas já aplicadas.
+    historico    = coletar_vagas(sb, max(args.dias, DIAS_FUNIL), limite=1000) if sb else []
+    para_aplicar = selecionar_para_aplicar(historico)
+    funil        = resumir_funil(historico)
 
     print("Coletando e-mails das labels do Gmail...")
     agendamentos = _listar_por_label(service, "AutoApply/Geral/Agendamento", args.dias)
@@ -525,6 +715,7 @@ def main():
     texto, html = montar_briefing(
         vagas, despesas, alertas, certificados,
         agendamentos, comunicados, args.dias,
+        para_aplicar=para_aplicar, funil=funil,
     )
 
     if args.preview:

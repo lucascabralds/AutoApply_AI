@@ -92,3 +92,9 @@ def test_formatos_de_resposta_de_vagas(monkeypatch, resposta, esperado):
     monkeypatch.setattr(gs, "_chamar_rota_ia", lambda *a, **k: resposta)
     assert [v["cargo"] for v in gs.extrair_vagas("Assunto", "r", "c")] == esperado
     assert gs.status_ultima_chamada() == "ok"
+
+
+def test_reparo_de_resposta_cortada_nao_perde_campos_depois_de_lista_interna():
+    # O "último ]" desta resposta é o fim de tecnologias — reparar só até ali perdia o link
+    raw = '[{"cargo": "Dev", "tecnologias": ["python", "sql"], "link": 0, "score": 80}, {"cargo": "Ana'
+    assert _parse_json(raw)[0] == {"cargo": "Dev", "tecnologias": ["python", "sql"], "link": 0, "score": 80}

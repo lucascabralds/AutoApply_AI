@@ -37,7 +37,7 @@ O algoritmo monitora ativamente a conta do Gmail e realiza a extração e o proc
 | Arquivo | Papel |
 |---|---|
 | `main.py` | Orquestrador: vagas → certificados → alertas → e-mails gerais, com labels no Gmail e gravação no Supabase. |
-| `briefing_diario.py` | Briefing matinal: resume as últimas 24h (vagas por score, despesas, agendamentos, alertas) e envia para o seu Gmail. |
+| `briefing_diario.py` | Briefing matinal: abre com **"Aplicar hoje"** (as melhores vagas ainda não aplicadas, com o porquê do score) e o **funil de candidaturas** (nova → aplicada → em processo → resultado, e candidaturas sem retorno), depois resume as últimas 24h (vagas, despesas, agendamentos, alertas) e envia para o seu Gmail. |
 | `gemini_service.py` | Prompts e parse robusto do JSON da IA (cercas de markdown, vírgulas soltas, respostas truncadas). |
 | `rota_ia_client.py` | Cliente HTTP do gateway Rota.IA com retry em 429/503. |
 | `google_auth.py` | OAuth2 único para todos os scripts (um só `token.json`, com todos os escopos). |
@@ -47,6 +47,8 @@ O algoritmo monitora ativamente a conta do Gmail e realiza a extração e o proc
 | `calendario.py` | Vencimentos e agendamentos → eventos no Google Calendar (com lembrete). |
 | `notificador.py` | Envio de mensagens pelo Telegram. |
 | `seguranca.py` | Redação de OTPs e links de recuperação antes de gravar/enviar. |
+| `match_vagas.py` | Score de aderência da vaga ao perfil, explicável ("+50 área-alvo: dados", "-25 nível sênior"), combinado com o score da IA. |
+| `vagas.py` | Linha de comando do funil: lista vagas e marca candidaturas feitas por fora (`aplicar`, `descartar`, `status`) pelo número #id do briefing. |
 | `candidatura.py` | Rascunhos de candidatura no Gmail: carta gerada pela IA a partir do perfil + currículo anexado. |
 | `services/gmail/add_task.py` | Follow-ups de vagas no Google Tasks. |
 | `supabase/schema.sql` | Schema idempotente de todas as tabelas. |
@@ -83,6 +85,24 @@ Preencha pelo menos `ROTA_IA_API_KEY`, `SUPABASE_URL` e `SUPABASE_KEY`. Todas as
 ### 5. Telegram (opcional)
 Crie um bot com o [@BotFather](https://t.me/BotFather), preencha `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID` e teste com `python notificador.py "olá"`.
 
+### 🪟 Passo a passo no Windows (PowerShell)
+```powershell
+cd C:\caminho\para\AutoApply_AI
+py -3 -m venv venv
+.\venv\Scripts\Activate.ps1     # erro de "execução de scripts desabilitada"? rode uma vez:
+                                  # Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+pip install -r requirements.txt
+Copy-Item .env.example .env
+notepad .env                      # preencha ROTA_IA_API_KEY, SUPABASE_URL, SUPABASE_KEY
+python google_auth.py             # 1x: abre o navegador e gera o token.json
+python diagnostico.py             # tudo OK? então:
+python main.py --dry-run          # roda sem gravar nada, só para ver o resultado
+```
+Dicas:
+- **Caminhos no `.env`** (ex.: `CURRICULO_PDF`): use barras normais (`C:/Users/Lucas/Documents/cv.pdf`) ou deixe sem aspas — entre aspas duplas, `\` vira caractere de escape.
+- **Pasta `venv` dentro do projeto:** não copie pastas do projeto (como `services/`) para dentro da `venv`; se aparecer `ImportError` estranho, apague a `venv` e recrie.
+- **Rota.IA** precisa estar rodando (`npm run start` na pasta do gateway) antes do pipeline; sem ele o pipeline não quebra, só deixa os e-mails de vaga para a próxima execução.
+
 ---
 
 ## 🚀 Uso
@@ -99,6 +119,11 @@ python briefing_diario.py --preview   # imprime o briefing no terminal
 python briefing_diario.py             # envia o briefing para o seu Gmail
 
 python gerar_dashboard.py --abrir     # gera dashboard/index.html e abre no navegador
+
+python vagas.py listar                # vagas novas (7 dias), maior score primeiro, com o porquê
+python vagas.py aplicar 123           # já me candidatei → sai do "Aplicar hoje" e entra no funil
+python vagas.py descartar 124         # sem interesse
+python vagas.py status 123 em_processo
 ```
 
 ### 🐳 Rodando sozinho (Docker)
@@ -112,11 +137,45 @@ docker compose logs -f          # o dashboard fica em ./dados/dashboard.html
 ```
 O container roda em modo headless (nunca tenta abrir navegador) e acessa o Rota.IA da máquina host via `host.docker.internal`. Sem Docker, `python agendador.py` faz o mesmo.
 
+### 🪟 Rodando sozinho no Windows (sem Docker)
+O mais simples é deixar `python agendador.py` aberto num terminal. Para não depender de terminal aberto, use o **Agendador de Tarefas** com o `windows\rodar.bat`, que ativa a venv, roda em modo headless e grava tudo em `logs\autoapply.log` (rode antes `python google_auth.py` uma vez no terminal):
+
+```powershell
+$proj = "C:\caminho\para\AutoApply_AI"
+# pipeline completo a cada 30 min
+schtasks /Create /TN "AutoApply AI - pipeline" /SC MINUTE /MO 30 /TR "$proj\windows\rodar.bat main.py"
+# briefing todo dia às 07:25
+schtasks /Create /TN "AutoApply AI - briefing" /SC DAILY /ST 07:25 /TR "$proj\windows\rodar.bat briefing_diario.py"
+# dashboard depois do pipeline
+schtasks /Create /TN "AutoApply AI - dashboard" /SC MINUTE /MO 30 /TR "$proj\windows\rodar.bat gerar_dashboard.py"
+```
+Para remover: `schtasks /Delete /TN "AutoApply AI - pipeline" /F`. Se o caminho do projeto tiver **espaços**, crie a tarefa pela interface do Agendador de Tarefas (Ação "Iniciar um programa" → Programa: `...\windows\rodar.bat`, Argumentos: `main.py`).
+
 Para rodar os testes:
 ```bash
 pip install -r requirements-dev.txt
 pytest -q
 ```
+
+---
+
+## 🎯 Como as vagas são priorizadas
+Cada vaga extraída recebe um **score de 0 a 100** calculado em `match_vagas.py` com regras do perfil — e cada ponto vem com o motivo:
+
+| Critério | Pontos |
+|---|---|
+| Cargo com Python | +55 |
+| Cargo de dados / BI / ETL / automação / backend | +50 |
+| Cargo de TI / desenvolvimento em geral | +30 |
+| Suporte / infraestrutura | +10 |
+| Cargo fora do perfil (vendedor, auxiliar, operador…) | score limitado a 15 |
+| Tecnologias do perfil (Python, SQL, Power BI, ETL, APIs, Docker…) | até +35 |
+| Só stack fora do perfil (Java, .NET, PHP…) | −10 |
+| Júnior / trainee / assistente · pleno · estágio · sênior/liderança | +10 · −5 · −10 · −25 |
+| Pede 4+ anos de experiência | −15 |
+| Remoto · presencial/híbrido em `LOCAIS_ACEITOS` · fora da região | +10 · +5 · −15 |
+
+Quando a IA também dá um score (> 0), o final é a média dos dois. O resultado aparece no log (`por quê: +55 cargo Python, +10 nível júnior…`), no push do Telegram, na seção **🎯 Aplicar hoje** do briefing e na coluna `motivos_match` do Supabase. A mesma vaga vinda de vários e-mails (digest repetido, Catho + LinkedIn) é gravada uma vez só. Discorda de um peso? Ajuste as tabelas no topo de `match_vagas.py`.
 
 ---
 
@@ -152,6 +211,10 @@ AutoApply/Geral/Veiculo              Detran, IPVA, licenciamento, multas, CNH
 - [x] Dashboard com dados reais do Supabase (antes: protótipo com dados fictícios)
 - [x] Docker + agendador (alertas a cada minuto, pipeline a cada 30 min, briefing diário)
 - [x] Status de candidatura: "sua candidatura foi enviada" / "você avançou de fase" atualizam a vaga existente (nova → aplicada → em_processo → reprovada/aprovada), sem duplicar
+
+- [x] Score de match explicável (regras do perfil + IA, com o motivo de cada ponto) e deduplicação da mesma vaga entre e-mails/fontes
+- [x] Briefing com "Aplicar hoje" e funil de candidaturas; `vagas.py` para marcar candidaturas feitas por fora
+- [x] Guia e `windows\rodar.bat` para rodar agendado no Windows
 
 **Próximos passos**
 1. **Automação de Finanças:** cruzar `despesas_domesticas` com as planilhas financeiras existentes.

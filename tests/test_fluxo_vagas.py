@@ -81,6 +81,7 @@ def ambiente(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "_CACHE_PATH", str(tmp_path / "cache.json"))
     monkeypatch.setattr(main, "_BUDGET_PATH", str(tmp_path / "budget.json"))
     monkeypatch.setattr(main, "_SCHEMA_VAGAS_V3", None)
+    monkeypatch.setattr(main, "_SCHEMA_VAGAS_MOTIVOS", None)
     monkeypatch.setattr(main.time, "sleep", lambda s: None)
     monkeypatch.setattr(main, "telegram_configurado", lambda: False)
     monkeypatch.setattr(main, "_status_ia", lambda: "ok")
@@ -121,6 +122,12 @@ def test_digest_vira_duas_vagas_com_links_corretos(ambiente):
     assert linhas["Analista de Dados Jr"]["links_candidatura"] == ["https://www.catho.com.br/vagas/analista-dados/2"]
     assert linhas["Desenvolvedor Python"]["tecnologias"] == ["python", "django"]
     assert linhas["Desenvolvedor Python"]["vaga_uid"] != linhas["Analista de Dados Jr"]["vaga_uid"]
+
+    # score final = regras do perfil + IA, com o porquê gravado junto
+    dev = linhas["Desenvolvedor Python"]
+    assert dev["score_ia"] == 85
+    assert any("cargo Python" in mot for mot in dev["motivos_match"])
+    assert dev["score_match"] >= 75
 
     # e-mail do próprio robô foi ignorado; o digest ganhou label de alta prioridade
     assert gmail.labels_aplicadas == {"m1": ["L_PAI", "L_ALTA"]}
@@ -203,3 +210,19 @@ def test_acoes_ignoram_vaga_de_acompanhamento(ambiente, monkeypatch):
     monkeypatch.setattr(main, "notificar_vaga", lambda v: enviados.append(1) or True)
     main.acoes_vaga_prioritaria(None, None, {"cargo": "X", "score_gemini": 99, "tipo_email": "retorno"}, "")
     assert enviados == []
+
+
+def test_mesmo_digest_em_dois_emails_nao_duplica_vaga_nem_push(ambiente, monkeypatch):
+    enviados = []
+    monkeypatch.setattr(main, "telegram_configurado", lambda: True)
+    monkeypatch.setattr(main, "notificar_vaga", lambda v: enviados.append(v["cargo"]) or True)
+    gmail, sb = _FakeGmail(), _FakeSupabase()
+    copia = dict(gmail.mensagens["m1"], id="m3")
+    gmail.mensagens["m3"] = copia          # o log real mostra o mesmo digest chegando 2x
+
+    main.rodar_vagas(gmail, {"vagas_pai": "P", "vagas_alta": "A", "vagas_baixa": "B"}, sb,
+                     "newer_than:1d", dry_run=False)
+
+    assert len(sb.gravados) == 2                       # 2 vagas, não 4
+    assert enviados == ["Desenvolvedor Python"]        # push uma vez só
+    assert set(gmail.labels_aplicadas) == {"m1", "m3"}  # os dois e-mails saem da fila

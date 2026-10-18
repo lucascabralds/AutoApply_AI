@@ -59,6 +59,7 @@ from bs4 import BeautifulSoup
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload
 
+import console
 import google_auth
 from notificador import enviar_telegram, escapar_html, telegram_configurado
 from formatacao import empresa_conhecida, formatar_reais
@@ -66,6 +67,7 @@ from seguranca import redigir_segredo
 from services.gmail.add_task import criar_tarefa_vaga
 import calendario
 import candidatura
+import match_vagas
 
 # ---------------------------------------------------------------------------
 # Supabase
@@ -389,6 +391,12 @@ class Log:
     @staticmethod
     def _ts():
         return datetime.datetime.now().strftime("%H:%M:%S")
+
+    @classmethod
+    def sem_cores(cls):
+        """Saída em arquivo/pipe (agendador, Agendador de Tarefas): sem códigos ANSI."""
+        for attr in ("RESET", "BOLD", "GREEN", "BLUE", "YELLOW", "RED", "CYAN", "GRAY"):
+            setattr(cls, attr, "")
 
     @classmethod
     def info(cls, msg):
@@ -876,18 +884,64 @@ def _sb_upsert_insert(sb: Client, tabela: str, registro: dict, conflict_col: str
         return False
 
 
-def _vaga_uid(email_id: str, cargo: str | None, empresa: str | None) -> str:
+# Parâmetros de rastreio que mudam a cada e-mail sem mudar a vaga
+_PARAMS_RASTREIO = re.compile(
+    r"^(utm_\w+|origem|origin|src|source|ref|refid|referrer|trk|trackingid|tracking_id|"
+    r"mid|eid|cid|campaign|campanha|fbclid|gclid|from|alertid|alert_id|lipi|midtoken|midsig|"
+    r"position|pagenum|sid|token|hash)$",
+    re.IGNORECASE,
+)
+
+
+def _canonizar_link(url: str | None) -> str:
     """
-    Identificador estável de UMA vaga: mesmo e-mail + mesmo cargo + mesma
-    empresa → mesmo uid. Permite upsert por vaga (um digest com 10 vagas
-    vira 10 linhas) sem duplicar quando o e-mail é processado de novo.
+    Link da vaga sem o que varia entre e-mails (utm_*, trackingId, fragmento,
+    barra final) — o mesmo anúncio vindo em dois digests vira o mesmo texto.
+    Parâmetros que identificam a vaga (ex.: ?jk= do Indeed) são mantidos.
     """
-    chave = "|".join([email_id or "", _normalizar_para_match(cargo or ""), _normalizar_para_match(empresa or "")])
+    if not url:
+        return ""
+    try:
+        p = urllib.parse.urlsplit(url.strip())
+    except ValueError:
+        return url.strip()
+    query = [(k, v) for k, v in urllib.parse.parse_qsl(p.query, keep_blank_values=True)
+             if not _PARAMS_RASTREIO.match(k)]
+    host = p.netloc.lower().removeprefix("www.")
+    return urllib.parse.urlunsplit(("https", host, p.path.rstrip("/"), urllib.parse.urlencode(sorted(query)), ""))
+
+
+def _vaga_uid(email_id: str, cargo: str | None, empresa: str | None, link: str | None = None) -> str:
+    """
+    Identificador estável de UMA vaga, independente do e-mail em que veio:
+      - empresa conhecida → cargo + empresa (o mesmo anúncio chega em vários
+        digests, e o mesmo digest às vezes chega 2x);
+      - empresa desconhecida, mas link próprio da vaga → cargo + link canônico;
+      - senão → e-mail + cargo (sem como saber se é a mesma vaga).
+    Permite upsert por vaga (um digest com 10 vagas vira 10 linhas) sem
+    duplicar a vaga quando ela reaparece.
+    """
+    cargo_n = _normalizar_para_match(cargo or "")
+    if empresa_conhecida(empresa):
+        chave = "|".join(["vaga", cargo_n, _normalizar_para_match(empresa)])
+    elif link:
+        chave = "|".join(["link", cargo_n, _canonizar_link(link)])
+    else:
+        chave = "|".join([email_id or "", cargo_n, _normalizar_para_match(empresa or "")])
     return hashlib.sha1(chave.encode("utf-8")).hexdigest()[:20]
+
+
+def _uid_da_vaga(vaga: dict) -> str:
+    """_vaga_uid() de um dict de vaga do pipeline (link só se for o link próprio da vaga)."""
+    link = vaga.get("link_candidatura") if vaga.get("link_especifico") else None
+    return _vaga_uid(vaga.get("email_id"), vaga.get("cargo"), vaga.get("empresa"), link)
 
 
 # None = ainda não testado nesta execução; False = banco sem a migração v3
 _SCHEMA_VAGAS_V3: bool | None = None
+# Mesma ideia para as colunas do score explicável (score_ia, motivos_match):
+# banco sem elas continua gravando a vaga, só sem os motivos.
+_SCHEMA_VAGAS_MOTIVOS: bool | None = None
 
 
 def _erro_de_schema(exc: Exception) -> bool:
@@ -905,7 +959,7 @@ def _erro_de_schema(exc: Exception) -> bool:
 
 
 def salvar_vaga(sb: Client | None, vaga: dict, dry_run: bool = False) -> bool:
-    global _SCHEMA_VAGAS_V3
+    global _SCHEMA_VAGAS_V3, _SCHEMA_VAGAS_MOTIVOS
     if dry_run:
         Log.info(f"  [DRY-RUN] vagas_extraidas: {vaga.get('cargo')} @ {vaga.get('empresa')}")
         return True
@@ -916,7 +970,7 @@ def salvar_vaga(sb: Client | None, vaga: dict, dry_run: bool = False) -> bool:
 
     if _SCHEMA_VAGAS_V3 is not False:
         registro = {
-            "vaga_uid":          _vaga_uid(vaga.get("email_id"), vaga.get("cargo"), vaga.get("empresa")),
+            "vaga_uid":          _uid_da_vaga(vaga),
             "gmail_message_id":  vaga.get("email_id"),
             "cargo":             vaga.get("cargo"),
             "empresa":           vaga.get("empresa"),
@@ -930,10 +984,27 @@ def salvar_vaga(sb: Client | None, vaga: dict, dry_run: bool = False) -> bool:
             "links_candidatura": links,
             "tipo_email":        vaga.get("tipo_email"),
             "data_email":        vaga.get("data_email"),
-            "status_aplicacao":  vaga.get("status", "nova"),
         }
+        # "nova" é o default da coluna: não mandar evita que a mesma vaga,
+        # reaparecendo num digest, volte de "aplicada" para "nova" no upsert.
+        if vaga.get("status", "nova") != "nova":
+            registro["status_aplicacao"] = vaga["status"]
+        if _SCHEMA_VAGAS_MOTIVOS is not False and "motivos_match" in vaga:
+            registro["score_ia"] = int(vaga.get("score_ia") or 0)
+            registro["motivos_match"] = vaga.get("motivos_match") or []
         try:
-            sb.table("vagas_extraidas").upsert(registro, on_conflict="vaga_uid").execute()
+            try:
+                sb.table("vagas_extraidas").upsert(registro, on_conflict="vaga_uid").execute()
+            except Exception as e:
+                if "motivos_match" not in registro or not _erro_de_schema(e):
+                    raise
+                # Banco ainda sem as colunas do score explicável: grava sem elas
+                _SCHEMA_VAGAS_MOTIVOS = False
+                Log.warn("  Tabela vagas_extraidas sem score_ia/motivos_match — rode supabase/schema.sql "
+                         "para guardar os motivos do score. Gravando sem eles.")
+                registro.pop("score_ia")
+                registro.pop("motivos_match")
+                sb.table("vagas_extraidas").upsert(registro, on_conflict="vaga_uid").execute()
             _SCHEMA_VAGAS_V3 = True
             return True
         except Exception as e:
@@ -961,7 +1032,8 @@ def salvar_vaga(sb: Client | None, vaga: dict, dry_run: bool = False) -> bool:
 
 # Funil de candidatura — o status de uma vaga só avança, nunca regride
 # (um "retorno" atrasado não pode desfazer um "avançou de fase").
-_ORDEM_STATUS = {"nova": 0, "aplicada": 1, "em_processo": 2, "reprovada": 3, "aprovada": 3}
+# "descartada" (marcada à mão com vagas.py) volta ao funil se chegar "candidatura enviada".
+_ORDEM_STATUS = {"nova": 0, "descartada": 0, "aplicada": 1, "em_processo": 2, "reprovada": 3, "aprovada": 3}
 
 
 def _status_do_email(tipo_email: str | None, status_candidatura: str | None) -> str:
@@ -1322,7 +1394,7 @@ def classificar_email_pipeline(assunto: str, remetente: str, corpo_preview: str,
     if any(p in txt for p in PALAVRAS_NAO_VAGA):
         if any(w in txt for w in _PALAVRAS_AGENDAMENTO):
             return "agendamento"
-        if any(w in txt for w in _PALAVRAS_FINANCEIRO):
+        if any(w in txt for w in _PALAVRAS_FINANCEIRO) and not _eh_promocao(txt):
             return "financeiro"
         return "servico"
 
@@ -1333,7 +1405,7 @@ def classificar_email_pipeline(assunto: str, remetente: str, corpo_preview: str,
     if any(w in txt for w in _PALAVRAS_AGENDAMENTO):
         return "agendamento"
     if any(w in txt for w in _PALAVRAS_FINANCEIRO):
-        return "financeiro"
+        return "servico" if _eh_promocao(txt) else "financeiro"
 
     if not _tem_budget("geral"):
         return "outro"
@@ -1479,6 +1551,8 @@ def notificar_vaga(vaga: dict) -> bool:
         escapar_html(f"{vaga['empresa']} · {vaga.get('modelo_trabalho') or 'Não informado'}"
                      + (f" · {vaga['local']}" if vaga.get("local") else "")),
     ]
+    if vaga.get("motivos_match"):
+        linhas.append(f"<i>{escapar_html(match_vagas.resumo_motivos(vaga['motivos_match']))}</i>")
     if vaga.get("link_candidatura"):
         linhas.append(f'<a href="{escapar_html(vaga["link_candidatura"])}">Ver vaga</a>')
     return enviar_telegram("\n".join(linhas))
@@ -1490,7 +1564,7 @@ def preparar_rascunho_candidatura(service, vaga: dict, texto_email: str) -> str 
     Uma vez por vaga (marcado no cache) e dentro do budget diário "cartas".
     Retorna o id do rascunho ou None.
     """
-    uid = _vaga_uid(vaga.get("email_id"), vaga.get("cargo"), vaga.get("empresa"))
+    uid = _uid_da_vaga(vaga)
     if _cache_get("rascunho", uid, str):
         return None
     if not _tem_budget("cartas") or not gateway_disponivel():
@@ -1537,7 +1611,7 @@ def _uma_vez_chave(acao: str, chave: str, executar) -> None:
 
 def _uma_vez(acao: str, vaga: dict, executar) -> None:
     """_uma_vez_chave() para efeitos de uma vaga específica."""
-    _uma_vez_chave(acao, _vaga_uid(vaga.get("email_id"), vaga.get("cargo"), vaga.get("empresa")), executar)
+    _uma_vez_chave(acao, _uid_da_vaga(vaga), executar)
 
 
 def acoes_vaga_prioritaria(service, tasks_service, vaga: dict, texto_recrutador: str) -> None:
@@ -1582,6 +1656,7 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
     total_salvas  = 0
     total_outros  = 0
     total_atualizadas = 0
+    total_repetidas = 0
 
     for msg in msgs:
         try:
@@ -1640,19 +1715,18 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
                 techs = list(dict.fromkeys(techs_corpo + techs_g))
             else:
                 techs = techs_g or techs_corpo
-            score    = vaga_raw.get("score_match", 0) or 0
-            score_max = max(score_max, score)
+            score_ia = vaga_raw.get("score_match", 0) or 0
 
             # [FIX] Prioridade do link: 1) o que o Gemini já escolheu entre
             # as âncoras reais fornecidas; 2) casar o cargo desta vaga
             # específica com a âncora de texto correspondente (essencial
             # em digests com N vagas no mesmo e-mail, ex.: Catho/Indeed);
             # 3) fallback heurístico geral.
-            link = (
+            link_especifico = (
                 vaga_raw.get("link_candidatura")
                 or _achar_ancora_por_cargo(vaga_raw.get("cargo") or assunto, ancoras, ancoras_usadas)
-                or _extrair_link_candidatura(corpo, remetente, ancoras)
             )
+            link = link_especifico or _extrair_link_candidatura(corpo, remetente, ancoras)
 
             vaga = {
                 "email_id":          msg["id"],
@@ -1666,15 +1740,26 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
                 "salario":           vaga_raw.get("salario"),
                 "requisitos":        vaga_raw.get("requisitos", []),
                 "tecnologias":       techs,
-                "score_gemini":      score,
+                "score_ia":          score_ia,
                 "tipo_email":        vaga_raw.get("tipo_email",         "nova_vaga"),
                 "status_candidatura":vaga_raw.get("status_candidatura", "nova"),
                 "link_candidatura":  link,
+                # o fallback genérico pode ser o mesmo link para todas as vagas
+                # do digest — só o link próprio da vaga serve para deduplicar
+                "link_especifico":   bool(link_especifico),
                 "descricao":         corpo[:400] if corpo else "",
                 "data_email":        data,
                 "status":            _status_do_email(vaga_raw.get("tipo_email"),
                                                       vaga_raw.get("status_candidatura")),
             }
+
+            # Score explicável: regras locais do perfil + score da IA (quando houver).
+            # É ele que decide label, push, follow-up e rascunho.
+            match = match_vagas.avaliar(vaga)
+            score = match_vagas.combinar(match["score"], score_ia)
+            vaga["score_gemini"] = score
+            vaga["motivos_match"] = match["motivos"]
+            score_max = max(score_max, score)
 
             # E-mail de acompanhamento de uma candidatura já conhecida →
             # atualiza a vaga existente em vez de criar uma duplicada.
@@ -1683,15 +1768,30 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
                 total_atualizadas += 1
                 continue
 
+            # A mesma vaga já veio em OUTRO e-mail (digest repetido, ou o mesmo
+            # anúncio na Catho e no LinkedIn): não grava de novo nem repete
+            # push/tarefa/rascunho.
+            uid = _uid_da_vaga(vaga)
+            vista_em = _cache_get("vista", uid, str)
+            if vaga["tipo_email"] == "nova_vaga" and vista_em and vista_em != msg["id"]:
+                Log.info(f"    ↺ repetida (já veio em outro e-mail): {vaga['cargo']} @ {vaga['empresa']}")
+                total_repetidas += 1
+                continue
+
             salvo = salvar_vaga(sb, vaga, dry_run)
             if salvo:
                 total_salvas += 1
+                if not dry_run:
+                    _cache_set("vista", uid, msg["id"])
 
             total_vagas += 1
             flag = "🔥" if score >= 75 else ("⚡" if score >= 50 else "·")
             tipo = vaga_raw.get("tipo_email", "nova_vaga")
             lk   = f" → {link[:50]}" if link else ""
             Log.ok(f"    {flag} [{tipo}] {vaga['cargo']} @ {vaga['empresa']} — score {score}%{lk}")
+            if match["motivos"]:
+                Log.info(f"        por quê: {match_vagas.resumo_motivos(match['motivos'])}"
+                         + (f" | IA {score_ia}%" if score_ia else ""))
 
             if not dry_run:
                 # Num digest o e-mail do recrutador não é confiável por vaga
@@ -1713,7 +1813,7 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
 
     Log.section(
         f"Vagas: {total_emails} e-mails | {total_vagas} vagas | "
-        f"{total_salvas} salvas | {total_atualizadas} status atualizados | "
+        f"{total_salvas} salvas | {total_repetidas} repetidas | {total_atualizadas} status atualizados | "
         f"{total_outros} outros módulos"
     )
 
@@ -2181,6 +2281,34 @@ _SUBCATEGORIA_FINANCEIRO = {
     "cobranca":      ["cobrança", "cobranca", "débito", "debito", "crédito", "pendente"],
 }
 
+# Marketing com preço/Pix/crédito no texto (KaBuM, "Acompanhe seu Score"...)
+# casava "pix", "crédito", "pagamento" e caía em financeiro — gastando IA e,
+# se a IA achasse um preço, virando "despesa". Promoção só deixa de ser
+# promoção quando há sinal forte de transação real (fatura, vencimento,
+# comprovante, pedido confirmado...). "boleto"/"pix" sozinhos não contam:
+# toda promoção diz "pague no boleto ou no Pix".
+_PADROES_PROMOCAO = re.compile(
+    r"\d+\s?%\s?(?:off|de desconto)"
+    r"|(?<!\w)(?:descontos?|ofertas?|promo[cç](?:[aã]o|[oõ]es)|cupom|cupons|frete gr[aá]tis"
+    r"|black friday|cyber monday|aproveite|imperd[ií]ve(?:l|is)|liquida[cç][aã]o|s[oó] hoje"
+    r"|[uú]ltimas unidades|acompanhe seu score|seu score|cashback|sale)(?!\w)",
+    re.IGNORECASE,
+)
+_PADROES_TRANSACAO = re.compile(
+    r"(?<!\w)(?:seu boleto|sua fatura|fatura (?:fechou|fechada|dispon[ií]vel|do cart[aã]o)|vencimento|vence (?:hoje|amanh[aã]|em)"
+    r"|nota fiscal|nf-?e|comprovante|recibo|valor a pagar|d[eé]bito autom[aá]tico"
+    r"|pagamento (?:confirmado|aprovado|recebido|realizado|pendente)"
+    r"|pedido (?:confirmado|aprovado|realizado|recebido|n[ºo°.]?\s?\d)"
+    r"|compra (?:aprovada|confirmada|realizada))(?!\w)",
+    re.IGNORECASE,
+)
+
+
+def _eh_promocao(texto: str) -> bool:
+    """True para e-mail de marketing sem sinal de transação real."""
+    return bool(_PADROES_PROMOCAO.search(texto or "")) and not _PADROES_TRANSACAO.search(texto or "")
+
+
 def _contem_termo(texto: str, termos: list[str]) -> bool:
     """Casa termos como palavra inteira — "doc" não pode casar com "documento", nem "ted" com "conectado"."""
     return any(re.search(r"(?<!\w)" + re.escape(t) + r"(?!\w)", texto) for t in termos)
@@ -2231,7 +2359,8 @@ def _categoria_heuristica(assunto: str, corpo: str) -> str:
         return "veiculo"
     for cat, padroes in _PADROES_GERAL.items():
         if any(p in txt for p in padroes):
-            return cat
+            # Promoção não é despesa: vira "servicos" e nem gasta IA
+            return "servicos" if cat == "financeiro" and _eh_promocao(txt) else cat
     return "servicos"   # fallback
 
 
@@ -2320,6 +2449,9 @@ def rodar_emails_gerais(service, labels: dict, sb: Client | None, query: str, dr
                 # IA tende a chamar isso só de "financeiro" — mantém veículo,
                 # exceto quando é um agendamento (vistoria, exame da CNH).
                 categoria_ia = _normalizar_categoria_geral(analise.get("categoria"), categoria)
+                # A IA também vê o preço da promoção e chama de "financeiro"
+                if categoria_ia == "financeiro" and _eh_promocao((assunto + " " + corpo[:300]).lower()):
+                    categoria_ia = "servicos"
                 if categoria != "veiculo" or categoria_ia == "agendamento":
                     categoria = categoria_ia
             except Exception as e:
@@ -2438,6 +2570,10 @@ def main():
         ),
     )
     args = parser.parse_args()
+
+    console.preparar_console()
+    if not console.cores_ativas():
+        Log.sem_cores()
 
     inicio = datetime.datetime.now()
     query  = f"newer_than:{args.dias}d"
