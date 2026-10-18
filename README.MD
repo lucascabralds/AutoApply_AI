@@ -47,6 +47,7 @@ O algoritmo monitora ativamente a conta do Gmail e realiza a extração e o proc
 | `calendario.py` | Vencimentos e agendamentos → eventos no Google Calendar (com lembrete). |
 | `notificador.py` | Envio de mensagens pelo Telegram. |
 | `seguranca.py` | Redação de OTPs e links de recuperação antes de gravar/enviar. |
+| `parsers_vagas.py` | Leitura sem IA dos digests da Catho e do Indeed (todas as vagas, com empresa, cidade, salário e link). |
 | `match_vagas.py` | Score de aderência da vaga ao perfil, explicável ("+50 área-alvo: dados", "-25 nível sênior"), combinado com o score da IA. |
 | `vagas.py` | Linha de comando do funil: lista vagas e marca candidaturas feitas por fora (`aplicar`, `descartar`, `status`) pelo número #id do briefing. |
 | `candidatura.py` | Rascunhos de candidatura no Gmail: carta gerada pela IA a partir do perfil + currículo anexado. |
@@ -158,6 +159,16 @@ pytest -q
 ```
 
 ---
+
+## 📋 Como as vagas são extraídas
+
+1. **Digests com molde conhecido são lidos por código, sem IA** (`parsers_vagas.py`):
+   - **Catho** ("Melhores vagas da semana", "Seu perfil se encaixa…"): cargo, empresa, cidade, salário e link de cada card.
+   - **Indeed** (alertas de vaga): cargo, empresa, cidade, salário, resumo e um link curto `viewjob?jk=…` sem os tokens pessoais do e-mail.
+
+   Todas as vagas do e-mail entram (num alerta do Indeed com 20 vagas, a IA extraía só 3), sem custo e sem resposta cortada.
+2. **Os demais e-mails** (vaga do dia da Catho, InfoJobs, Gupy, recrutador direto…) vão para a IA, como antes.
+3. Se uma plataforma mudar o molde, o parser não reconhece nada e o e-mail cai no caminho da IA: **nada quebra**.
 
 ## 🎯 Como as vagas são priorizadas
 Cada vaga extraída recebe um **score de 0 a 100** calculado em `match_vagas.py` com regras do perfil — e cada ponto vem com o motivo:

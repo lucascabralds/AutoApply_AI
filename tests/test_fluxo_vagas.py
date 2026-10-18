@@ -37,7 +37,7 @@ class _FakeGmail:
                 "payload": {
                     "headers": [
                         {"name": "Subject", "value": "2 novas vagas para Programador Python"},
-                        {"name": "From", "value": "Catho <avisovagas@catho.com.br>"},
+                        {"name": "From", "value": "Gupy <alertas@gupy.io>"},
                         {"name": "Date", "value": "Fri, 16 Oct 2026 08:00:00 -0300"},
                     ],
                     "mimeType": "multipart/alternative",
@@ -226,3 +226,27 @@ def test_mesmo_digest_em_dois_emails_nao_duplica_vaga_nem_push(ambiente, monkeyp
     assert len(sb.gravados) == 2                       # 2 vagas, não 4
     assert enviados == ["Desenvolvedor Python"]        # push uma vez só
     assert set(gmail.labels_aplicadas) == {"m1", "m3"}  # os dois e-mails saem da fila
+
+
+def test_digest_da_catho_e_lido_por_codigo_sem_chamar_a_ia(ambiente):
+    from tests.test_parsers_vagas import HTML_CATHO
+    gmail, sb = _FakeGmail(), _FakeSupabase(schema_v3=True)
+    gmail.mensagens = {"c1": {
+        "id": "c1",
+        "payload": {
+            "headers": [
+                {"name": "Subject", "value": "Melhores vagas da semana: analista de dados em São Paulo"},
+                {"name": "From", "value": "Catho <avisovagas@catho.com.br>"},
+            ],
+            "mimeType": "multipart/alternative",
+            "parts": [{"mimeType": "text/html", "body": {"data": _b64url(HTML_CATHO)}}],
+        },
+    }}
+    main.rodar_vagas(gmail, {"vagas_pai": "P", "vagas_alta": "A", "vagas_baixa": "B"}, sb, "q", dry_run=False)
+    assert ambiente == []                                   # a IA não foi chamada
+    cargos = sorted(r["cargo"] for _, _, r, _ in sb.gravados)
+    assert cargos == ["Analista de Dados Jr - Python", "Desenvolvedor Python Júnior Home Office"]
+    dev = next(r for _, _, r, _ in sb.gravados if r["cargo"].startswith("Desenvolvedor"))
+    assert dev["empresa"] is None or dev["empresa"] == "Empresa Confidencial"
+    assert dev["links_candidatura"] == ["https://www.catho.com.br/vagas/desenvolvedor-python-junior/22222222/"]
+    assert dev["score_match"] > 0                           # score local, mesmo sem IA
