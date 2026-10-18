@@ -68,6 +68,7 @@ from services.gmail.add_task import criar_tarefa_vaga
 import calendario
 import candidatura
 import match_vagas
+import parsers_vagas
 
 # ---------------------------------------------------------------------------
 # Supabase
@@ -711,6 +712,8 @@ def _resolver_link_real(href: str) -> str:
             qs = urllib.parse.parse_qs(parsed.query)
             payload = qs.get("i", [None])[0]
             if payload:
+                # parse_qs troca "+" (válido no base64 padrão da Catho) por espaço
+                payload = payload.replace(" ", "+")
                 pad = "=" * (-len(payload) % 4)
                 decodificado = base64.urlsafe_b64decode(payload + pad)
                 dados = json.loads(decodificado)
@@ -1690,7 +1693,16 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
 
         # ── Etapa 2: extrair vagas (suporta múltiplas por e-mail) ─────────────
         Log.info(f"  Extraindo vagas de: {assunto[:60]}")
-        vagas_extraidas = extrair_vagas_pipeline(assunto, remetente, corpo, msg["id"], ancoras=ancoras)
+        # Digests com molde conhecido (Catho, Indeed) são lidos por código:
+        # todas as vagas, sem custo de IA e sem resposta cortada. Molde não
+        # reconhecido → None → caminho com IA, como antes.
+        vagas_extraidas = parsers_vagas.extrair(
+            remetente, corpo, html_bruto, _extrair_tecnologias, _resolver_link_real,
+        )
+        if vagas_extraidas:
+            Log.info(f"  📋 {len(vagas_extraidas)} vaga(s) lidas direto do e-mail (sem IA)")
+        else:
+            vagas_extraidas = extrair_vagas_pipeline(assunto, remetente, corpo, msg["id"], ancoras=ancoras)
 
         if vagas_extraidas is None:
             continue   # IA indisponível — sem label, tenta de novo na próxima execução
@@ -1711,7 +1723,10 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
                         if isinstance(t, str)]
             # Tecnologias achadas no corpo inteiro só valem para e-mails de
             # 1 vaga — num digest elas misturariam as stacks de todas as vagas.
-            if len(vagas_extraidas) == 1:
+            # (vagas do parser já trazem as tecnologias do próprio card)
+            if vaga_raw.get("origem_extracao") == "parser":
+                techs = techs_g
+            elif len(vagas_extraidas) == 1:
                 techs = list(dict.fromkeys(techs_corpo + techs_g))
             else:
                 techs = techs_g or techs_corpo
@@ -1747,7 +1762,7 @@ def rodar_vagas(service, labels: dict, sb: Client | None, query: str, dry_run: b
                 # o fallback genérico pode ser o mesmo link para todas as vagas
                 # do digest — só o link próprio da vaga serve para deduplicar
                 "link_especifico":   bool(link_especifico),
-                "descricao":         corpo[:400] if corpo else "",
+                "descricao":         vaga_raw.get("resumo") or (corpo[:400] if corpo else ""),
                 "data_email":        data,
                 "status":            _status_do_email(vaga_raw.get("tipo_email"),
                                                       vaga_raw.get("status_candidatura")),
